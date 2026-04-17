@@ -461,8 +461,14 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     for item in tpl.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "history.jsonl")
+    _write(tpl / "identity" / "SOUL.md", workspace / "identity" / "SOUL.md")
+    _write(tpl / "identity" / "USER_RULES.md", workspace / "identity" / "USER_RULES.md")
+    _write(tpl / "identity" / "USER_PROFILE.md", workspace / "identity" / "USER_PROFILE.md")
+    _write(tpl / "working" / "CURRENT.md", workspace / "working" / "CURRENT.md")
+    archive_history = workspace / "archive" / "history.jsonl"
+    _write(None, archive_history)
+    _write(None, workspace / "archive" / "reflections.jsonl")
+    _write(None, workspace / "candidate" / "observations.jsonl")
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
@@ -474,7 +480,10 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     try:
         from nanobot.utils.gitstore import GitStore
         gs = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
+            "identity/SOUL.md",
+            "identity/USER_RULES.md",
+            "identity/USER_PROFILE.md",
+            "working/CURRENT.md",
         ])
         gs.init()
     except Exception:

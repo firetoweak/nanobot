@@ -1,35 +1,67 @@
 # Memory in nanobot
 
-> **Note:** This design is currently an experiment in the latest source code version and is planned to officially ship in `v0.1.5`.
+nanobot's memory is built around one idea: not every remembered fact deserves the same privilege.
 
-nanobot's memory is built on a simple belief: memory should feel alive, but it should not feel chaotic.
+Some information should shape the assistant's stable identity. Some belongs only to the current working state. Some should be searchable but not injected into every prompt. Some should remain a candidate until it earns promotion.
 
-Good memory is not a pile of notes. It is a quiet system of attention. It notices what is worth keeping, lets go of what no longer needs the spotlight, and turns lived experience into something calm, durable, and useful.
-
-That is the shape of memory in nanobot.
+That is why nanobot uses a permission-layered memory system.
 
 ## The Design
 
-nanobot does not treat memory as one giant file.
+nanobot separates memory into layers:
 
-It separates memory into layers, because different kinds of remembering deserve different tools:
+- `session.messages` holds the live short-term conversation.
+- `identity/` holds stable assistant identity and durable user context that is allowed to live in the prompt.
+- `working/CURRENT.md` holds active handoff notes and short-lived working state.
+- `archive/` holds machine-friendly history and reflections for search and review.
+- `candidate/observations.jsonl` holds candidate observations and promotion proposals that are not yet trusted enough for identity.
+- `GitStore` records changes to the primary prompt memory files so they can be inspected and restored.
 
-- `session.messages` holds the living short-term conversation.
-- `memory/history.jsonl` is the running archive of compressed past turns.
-- `SOUL.md`, `USER.md`, and `memory/MEMORY.md` are the durable knowledge files.
-- `GitStore` records how those durable files change over time.
+This keeps the system light in the moment, but durable over time without letting every summary become permanent identity.
 
-This keeps the system light in the moment, but reflective over time.
+## The Files
+
+```text
+workspace/
+├── identity/
+│   ├── SOUL.md              # Stable assistant principles, tone, and boundaries
+│   ├── USER_RULES.md        # Durable user instructions and workflow constraints
+│   └── USER_PROFILE.md      # Durable user background and stable preferences
+├── working/
+│   └── CURRENT.md           # Active handoff and short-lived working context
+├── archive/
+│   ├── history.jsonl        # Append-only summarized history
+│   ├── reflections.jsonl    # Dream and heartbeat reflection notes
+│   ├── .cursor              # Consolidator write cursor
+│   └── .dream_cursor        # Dream consumption cursor
+├── candidate/
+│   └── observations.jsonl   # Candidate observations awaiting review or promotion
+```
+
+## Prompt Injection Boundary
+
+Only the following memory is injected into the core system prompt by default:
+
+- `identity/SOUL.md`
+- `identity/USER_RULES.md`
+- `identity/USER_PROFILE.md`
+- `working/CURRENT.md`
+
+The following are **not** prompt-default memory sources:
+
+- `archive/history.jsonl`
+- `archive/reflections.jsonl`
+- `candidate/observations.jsonl`
+
+Those stores exist for search, review, and promotion workflows.
 
 ## The Flow
 
-Memory moves through nanobot in two stages.
+Memory now moves through four stages rather than one undifferentiated long-term store.
 
 ### Stage 1: Consolidator
 
-When a conversation grows large enough to pressure the context window, nanobot does not try to carry every old message forever.
-
-Instead, the `Consolidator` summarizes the oldest safe slice of the conversation and appends that summary to `memory/history.jsonl`.
+When a conversation grows large enough to pressure the context window, nanobot summarizes the oldest safe slice and appends it to `archive/history.jsonl`.
 
 This file is:
 
@@ -43,76 +75,79 @@ Each line is a JSON object:
 {"cursor": 42, "timestamp": "2026-04-03 00:02", "content": "- User prefers dark mode\n- Decided to use PostgreSQL"}
 ```
 
-It is not the final memory. It is the material from which final memory is shaped.
-
 ### Stage 2: Dream
 
-`Dream` is the slower, more thoughtful layer. It runs on a cron schedule by default and can also be triggered manually.
+`Dream` is the slower reflective layer. It runs on a schedule by default and can also be triggered manually.
 
 Dream reads:
 
-- new entries from `memory/history.jsonl`
-- the current `SOUL.md`
-- the current `USER.md`
-- the current `memory/MEMORY.md`
+- new entries from `archive/history.jsonl`
+- the current layered memory state
 
-Then it works in two phases:
+Dream does **not** directly rewrite identity by default. Its normal write targets are:
 
-1. It studies what is new and what is already known.
-2. It edits the long-term files surgically, not by rewriting everything, but by making the smallest honest change that keeps memory coherent.
+- `working/CURRENT.md`
+- `archive/reflections.jsonl`
+- `candidate/observations.jsonl`
 
-This is why nanobot's memory is not just archival. It is interpretive.
+This keeps reflection and observation separate from authority.
 
-## The Files
+### Stage 3: Promoter
 
-```
-workspace/
-├── SOUL.md              # The bot's long-term voice and communication style
-├── USER.md              # Stable knowledge about the user
-└── memory/
-    ├── MEMORY.md        # Project facts, decisions, and durable context
-    ├── history.jsonl    # Append-only history summaries
-    ├── .cursor          # Consolidator write cursor
-    ├── .dream_cursor    # Dream consumption cursor
-    └── .git/            # Version history for long-term memory files
-```
+`Promoter` is the privilege boundary between candidate memory and identity memory.
 
-These files play different roles:
+It reviews `candidate/observations.jsonl` and decides whether an observation should remain a candidate, be rejected, or be promoted into:
 
-- `SOUL.md` remembers how nanobot should sound.
-- `USER.md` remembers who the user is and what they prefer.
-- `MEMORY.md` remembers what remains true about the work itself.
-- `history.jsonl` remembers what happened on the way there.
+- `identity/SOUL.md`
+- `identity/USER_RULES.md`
+- `identity/USER_PROFILE.md`
 
-## Why `history.jsonl`
+The first implementation favors hard rules, such as:
 
-The old `HISTORY.md` format was pleasant for casual reading, but it was too fragile as an operational substrate.
+- explicit user statements
+- repeated evidence across sessions
 
-`history.jsonl` gives nanobot:
+This prevents a single bad Dream abstraction from immediately mutating long-lived prompt identity.
 
-- stable incremental cursors
-- safer machine parsing
-- easier batching
-- cleaner migration and compaction
-- a better boundary between raw history and curated knowledge
+### Stage 4: Heartbeat and Background Tasks
 
-You can still search it with familiar tools:
+Heartbeat jobs may write to tightly limited memory targets such as `working/CURRENT.md` and `archive/reflections.jsonl`.
+
+They do not receive broad write authority over the whole memory tree.
+
+## Why Layered Memory
+
+The old single-bucket approach was simple, but it created a dangerous privilege pattern: a summary extracted from history could become stable identity too easily.
+
+The layered design fixes that by separating:
+
+- identity that is allowed to shape future behavior
+- working state that should expire
+- archive that should be searchable but not always injected
+- candidates that must earn promotion
+
+In short: memory pollution is often a privilege-escalation problem, not just a factual-error problem.
+
+## Searching Past Events
+
+Use the JSONL stores for historical lookup:
+
+- `archive/history.jsonl`
+- `archive/reflections.jsonl`
+- `candidate/observations.jsonl`
+
+Typical searches:
 
 ```bash
-# grep
-grep -i "keyword" memory/history.jsonl
+# Search summarized history
+rg -i "keyword" archive/history.jsonl
 
-# jq
-cat memory/history.jsonl | jq -r 'select(.content | test("keyword"; "i")) | .content' | tail -20
+# Search candidate observations
+rg -i "prefers concise" candidate/observations.jsonl
 
-# Python
-python -c "import json; [print(json.loads(l).get('content','')) for l in open('memory/history.jsonl','r',encoding='utf-8') if l.strip() and 'keyword' in l.lower()][-20:]"
+# Count matches across archive JSONL files
+rg -i --glob "*.jsonl" "keyword" archive
 ```
-
-The difference is philosophical as much as technical:
-
-- `history.jsonl` is for structure
-- `SOUL.md`, `USER.md`, and `MEMORY.md` are for meaning
 
 ## Commands
 
@@ -126,19 +161,22 @@ Memory is not hidden behind the curtain. Users can inspect and guide it.
 | `/dream-restore` | List recent Dream memory versions |
 | `/dream-restore <sha>` | Restore memory to the state before a specific change |
 
-These commands exist for a reason: automatic memory is powerful, but users should always retain the right to inspect, understand, and restore it.
+These commands exist because automatic memory is powerful, but users should retain the right to inspect, understand, and restore it.
 
 ## Versioned Memory
 
-After Dream changes long-term memory files, nanobot can record that change with `GitStore`.
+`GitStore` tracks the primary prompt memory files:
 
-This gives memory a history of its own:
+- `identity/SOUL.md`
+- `identity/USER_RULES.md`
+- `identity/USER_PROFILE.md`
+- `working/CURRENT.md`
+
+This makes prompt-critical memory auditable:
 
 - you can inspect what changed
 - you can compare versions
 - you can restore a previous state
-
-That turns memory from a silent mutation into an auditable process.
 
 ## Configuration
 
@@ -168,24 +206,17 @@ Dream is configured under `agents.defaults.dream`:
 
 In practical terms:
 
-- `modelOverride: null` means Dream uses the same model as the main agent. Set it only if you want Dream to run on a different model.
-- `maxBatchSize` controls how many new `history.jsonl` entries Dream consumes in one run. Larger batches catch up faster; smaller batches are lighter and steadier.
-- `maxIterations` limits how many read/edit steps Dream can take while updating `SOUL.md`, `USER.md`, and `MEMORY.md`. It is a safety budget, not a quality score.
+- `modelOverride: null` means Dream uses the same model as the main agent.
+- `maxBatchSize` controls how many new `archive/history.jsonl` entries Dream consumes in one run.
+- `maxIterations` limits how many read/edit steps Dream can take while updating working, archive, and candidate outputs.
 - `intervalH` is the normal way to configure Dream. Internally it runs as an `every` schedule, not as a cron expression.
-
-Legacy note:
-
-- Older source-based configs may still contain `dream.cron`. nanobot continues to honor it for backward compatibility, but new configs should use `intervalH`.
-- Older source-based configs may still contain `dream.model`. nanobot continues to honor it for backward compatibility, but new configs should use `modelOverride`.
 
 ## In Practice
 
 What this means in daily use is simple:
 
 - conversations can stay fast without carrying infinite context
-- durable facts can become clearer over time instead of noisier
-- the user can inspect and restore memory when needed
+- durable facts become clearer without every observation becoming identity
+- users can inspect and restore prompt-critical memory
 
-Memory should not feel like a dump. It should feel like continuity.
-
-That is what this design is trying to protect.
+Memory should not feel like a dump. It should feel like continuity with permissions.

@@ -91,21 +91,21 @@ async def test_grep_defaults_to_files_with_matches(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_grep_supports_case_insensitive_search(tmp_path: Path) -> None:
-    (tmp_path / "memory").mkdir()
-    (tmp_path / "memory" / "HISTORY.md").write_text(
-        "[2026-04-02 10:00] OAuth token rotated\n",
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "history.jsonl").write_text(
+        '{"cursor": 1, "timestamp": "2026-04-02 10:00", "content": "OAuth token rotated"}\n',
         encoding="utf-8",
     )
 
     tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
     result = await tool.execute(
         pattern="oauth",
-        path="memory/HISTORY.md",
+        path="archive/history.jsonl",
         case_insensitive=True,
         output_mode="content",
     )
 
-    assert "memory/HISTORY.md:1" in result
+    assert "archive/history.jsonl:1" in result
     assert "OAuth token rotated" in result
 
 
@@ -127,22 +127,22 @@ async def test_grep_type_filter_limits_files(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_grep_fixed_strings_treats_regex_chars_literally(tmp_path: Path) -> None:
-    (tmp_path / "memory").mkdir()
-    (tmp_path / "memory" / "HISTORY.md").write_text(
-        "[2026-04-02 10:00] OAuth token rotated\n",
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "history.jsonl").write_text(
+        '{"cursor": 1, "timestamp": "2026-04-02 10:00", "content": "OAuth token rotated"}\n',
         encoding="utf-8",
     )
 
     tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
     result = await tool.execute(
-        pattern="[2026-04-02 10:00]",
-        path="memory/HISTORY.md",
+        pattern='"timestamp": "2026-04-02 10:00"',
+        path="archive/history.jsonl",
         fixed_strings=True,
         output_mode="content",
     )
 
-    assert "memory/HISTORY.md:1" in result
-    assert "[2026-04-02 10:00] OAuth token rotated" in result
+    assert "archive/history.jsonl:1" in result
+    assert '"timestamp": "2026-04-02 10:00"' in result
 
 
 @pytest.mark.asyncio
@@ -168,8 +168,10 @@ async def test_grep_files_with_matches_mode_returns_unique_paths(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_grep_files_with_matches_supports_head_limit_and_offset(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
-    for name in ("a.py", "b.py", "c.py"):
-        (tmp_path / "src" / name).write_text("needle\n", encoding="utf-8")
+    for idx, name in enumerate(("a.py", "b.py", "c.py"), start=1):
+        path = tmp_path / "src" / name
+        path.write_text("needle\n", encoding="utf-8")
+        os.utime(path, (idx, idx))
 
     tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
     result = await tool.execute(

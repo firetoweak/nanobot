@@ -1,21 +1,24 @@
-Update memory files based on the analysis below.
-- [FILE] entries: add the described content to the appropriate file
-- [FILE-REMOVE] entries: delete the corresponding content from memory files
-- [SKILL] entries: create a new skill under skills/<name>/SKILL.md using write_file
+Update layered memory files based on the analysis below.
+- [WORKING] entries: update `working/CURRENT.md`
+- [REFLECTION] entries: append JSON lines to `archive/reflections.jsonl`
+- [OBSERVATION] entries: append JSON lines to `candidate/observations.jsonl`
+- [PROMOTION] entries: append JSON lines to `candidate/observations.jsonl`
+- [SKILL] entries: create a new skill under `skills/<name>/SKILL.md` using `write_file`
 
 ## File paths (relative to workspace root)
-- SOUL.md
-- USER.md
-- memory/MEMORY.md
+- working/CURRENT.md
+- archive/reflections.jsonl
+- candidate/observations.jsonl
 - skills/<name>/SKILL.md (for [SKILL] entries only)
 
 Do NOT guess paths.
+Do NOT edit `identity/*`.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
 - Use exact text as old_text, include surrounding blank lines for unique match
 - Batch changes to the same file into one edit_file call
-- For deletions: section header + all bullets as old_text, new_text empty
+- For JSONL appends, use `edit_file` with `old_text=""` when the file is empty, otherwise replace the full current content with the old content plus the new lines appended
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools
 

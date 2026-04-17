@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import weakref
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+from uuid import uuid4
 
 from loguru import logger
 
@@ -24,35 +24,42 @@ if TYPE_CHECKING:
     from nanobot.session.manager import Session, SessionManager
 
 
+TRACKED_MEMORY_FILES = [
+    "identity/SOUL.md",
+    "identity/USER_RULES.md",
+    "identity/USER_PROFILE.md",
+    "working/CURRENT.md",
+]
+
+
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
-    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
+    """Pure file I/O for the layered memory files."""
 
     _DEFAULT_MAX_HISTORY = 1000
-    _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
-    _LEGACY_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*")
-    _LEGACY_RAW_MESSAGE_RE = re.compile(
-        r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
-    )
 
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "history.jsonl"
-        self.legacy_history_file = self.memory_dir / "HISTORY.md"
-        self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
-        self._cursor_file = self.memory_dir / ".cursor"
-        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
-        self._maybe_migrate_legacy_history()
+        self.identity_dir = ensure_dir(workspace / "identity")
+        self.working_dir = ensure_dir(workspace / "working")
+        self.archive_dir = ensure_dir(workspace / "archive")
+        self.candidate_dir = ensure_dir(workspace / "candidate")
+
+        self.soul_file = self.identity_dir / "SOUL.md"
+        self.user_rules_file = self.identity_dir / "USER_RULES.md"
+        self.user_profile_file = self.identity_dir / "USER_PROFILE.md"
+        self.current_file = self.working_dir / "CURRENT.md"
+        self.history_file = self.archive_dir / "history.jsonl"
+        self.reflections_file = self.archive_dir / "reflections.jsonl"
+        self.observations_file = self.candidate_dir / "observations.jsonl"
+
+        self._cursor_file = self.archive_dir / ".cursor"
+        self._dream_cursor_file = self.archive_dir / ".dream_cursor"
+        self._git = GitStore(workspace, tracked_files=TRACKED_MEMORY_FILES)
 
     @property
     def git(self) -> GitStore:
@@ -67,134 +74,7 @@ class MemoryStore:
         except FileNotFoundError:
             return ""
 
-    def _maybe_migrate_legacy_history(self) -> None:
-        """One-time upgrade from legacy HISTORY.md to history.jsonl.
-
-        The migration is best-effort and prioritizes preserving as much content
-        as possible over perfect parsing.
-        """
-        if not self.legacy_history_file.exists():
-            return
-        if self.history_file.exists() and self.history_file.stat().st_size > 0:
-            return
-
-        try:
-            legacy_text = self.legacy_history_file.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        except OSError:
-            logger.exception("Failed to read legacy HISTORY.md for migration")
-            return
-
-        entries = self._parse_legacy_history(legacy_text)
-        try:
-            if entries:
-                self._write_entries(entries)
-                last_cursor = entries[-1]["cursor"]
-                self._cursor_file.write_text(str(last_cursor), encoding="utf-8")
-                # Default to "already processed" so upgrades do not replay the
-                # user's entire historical archive into Dream on first start.
-                self._dream_cursor_file.write_text(str(last_cursor), encoding="utf-8")
-
-            backup_path = self._next_legacy_backup_path()
-            self.legacy_history_file.replace(backup_path)
-            logger.info(
-                "Migrated legacy HISTORY.md to history.jsonl ({} entries)",
-                len(entries),
-            )
-        except Exception:
-            logger.exception("Failed to migrate legacy HISTORY.md")
-
-    def _parse_legacy_history(self, text: str) -> list[dict[str, Any]]:
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not normalized:
-            return []
-
-        fallback_timestamp = self._legacy_fallback_timestamp()
-        entries: list[dict[str, Any]] = []
-        chunks = self._split_legacy_history_chunks(normalized)
-
-        for cursor, chunk in enumerate(chunks, start=1):
-            timestamp = fallback_timestamp
-            content = chunk
-            match = self._LEGACY_TIMESTAMP_RE.match(chunk)
-            if match:
-                timestamp = match.group(1)
-                remainder = chunk[match.end():].lstrip()
-                if remainder:
-                    content = remainder
-
-            entries.append({
-                "cursor": cursor,
-                "timestamp": timestamp,
-                "content": content,
-            })
-        return entries
-
-    def _split_legacy_history_chunks(self, text: str) -> list[str]:
-        lines = text.split("\n")
-        chunks: list[str] = []
-        current: list[str] = []
-        saw_blank_separator = False
-
-        for line in lines:
-            if saw_blank_separator and line.strip() and current:
-                chunks.append("\n".join(current).strip())
-                current = [line]
-                saw_blank_separator = False
-                continue
-            if self._should_start_new_legacy_chunk(line, current):
-                chunks.append("\n".join(current).strip())
-                current = [line]
-                saw_blank_separator = False
-                continue
-            current.append(line)
-            saw_blank_separator = not line.strip()
-
-        if current:
-            chunks.append("\n".join(current).strip())
-        return [chunk for chunk in chunks if chunk]
-
-    def _should_start_new_legacy_chunk(self, line: str, current: list[str]) -> bool:
-        if not current:
-            return False
-        if not self._LEGACY_ENTRY_START_RE.match(line):
-            return False
-        if self._is_raw_legacy_chunk(current) and self._LEGACY_RAW_MESSAGE_RE.match(line):
-            return False
-        return True
-
-    def _is_raw_legacy_chunk(self, lines: list[str]) -> bool:
-        first_nonempty = next((line for line in lines if line.strip()), "")
-        match = self._LEGACY_TIMESTAMP_RE.match(first_nonempty)
-        if not match:
-            return False
-        return first_nonempty[match.end():].lstrip().startswith("[RAW]")
-
-    def _legacy_fallback_timestamp(self) -> str:
-        try:
-            return datetime.fromtimestamp(
-                self.legacy_history_file.stat().st_mtime,
-            ).strftime("%Y-%m-%d %H:%M")
-        except OSError:
-            return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    def _next_legacy_backup_path(self) -> Path:
-        candidate = self.memory_dir / "HISTORY.md.bak"
-        suffix = 2
-        while candidate.exists():
-            candidate = self.memory_dir / f"HISTORY.md.bak.{suffix}"
-            suffix += 1
-        return candidate
-
-    # -- MEMORY.md (long-term facts) -----------------------------------------
-
-    def read_memory(self) -> str:
-        return self.read_file(self.memory_file)
-
-    def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+    # -- identity / working --------------------------------------------------
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -204,19 +84,67 @@ class MemoryStore:
     def write_soul(self, content: str) -> None:
         self.soul_file.write_text(content, encoding="utf-8")
 
-    # -- USER.md -------------------------------------------------------------
+    def read_user_rules(self) -> str:
+        return self.read_file(self.user_rules_file)
 
-    def read_user(self) -> str:
-        return self.read_file(self.user_file)
+    def write_user_rules(self, content: str) -> None:
+        self.user_rules_file.write_text(content, encoding="utf-8")
 
-    def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+    def read_user_profile(self) -> str:
+        return self.read_file(self.user_profile_file)
+
+    def write_user_profile(self, content: str) -> None:
+        self.user_profile_file.write_text(content, encoding="utf-8")
+
+    def read_current(self) -> str:
+        return self.read_file(self.current_file)
+
+    def write_current(self, content: str) -> None:
+        self.current_file.write_text(content, encoding="utf-8")
 
     # -- context injection (used by context.py) ------------------------------
 
-    def get_memory_context(self) -> str:
-        long_term = self.read_memory()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+    def get_identity_context(self) -> str:
+        parts = []
+        if soul := self.read_soul().strip():
+            parts.append(f"## identity/SOUL.md\n{soul}")
+        if user_rules := self.read_user_rules().strip():
+            parts.append(f"## identity/USER_RULES.md\n{user_rules}")
+        if user_profile := self.read_user_profile().strip():
+            parts.append(f"## identity/USER_PROFILE.md\n{user_profile}")
+        return "\n\n".join(parts)
+
+    def get_working_context(self) -> str:
+        current = self.read_current().strip()
+        return f"## working/CURRENT.md\n{current}" if current else ""
+
+    def get_recent_history_context(self, max_entries: int = 20) -> str:
+        entries = self._read_entries()[-max_entries:]
+        if not entries:
+            return ""
+        return "\n".join(f"- [{e['timestamp']}] {e['content']}" for e in entries)
+
+    def get_recent_reflections_context(self, max_entries: int = 10) -> str:
+        entries = self._read_jsonl(self.reflections_file)[-max_entries:]
+        if not entries:
+            return ""
+        return "\n".join(
+            f"- [{e.get('timestamp', '?')}] {e.get('content', '')}".rstrip()
+            for e in entries
+        )
+
+    def get_candidate_context(self, max_entries: int = 10) -> str:
+        entries = self.read_candidate_observations()[-max_entries:]
+        if not entries:
+            return ""
+        lines = []
+        for entry in entries:
+            lines.append(
+                f"- [{entry.get('timestamp', '?')}] "
+                f"{entry.get('type', 'observation')} / {entry.get('status', 'candidate')}: "
+                f"{entry.get('content', '')}"
+            )
+        return "\n".join(lines)
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
@@ -257,23 +185,83 @@ class MemoryStore:
         kept = entries[-self.max_history_entries:]
         self._write_entries(kept)
 
+    # -- reflection / candidate helpers -------------------------------------
+
+    def append_reflection(
+        self,
+        content: str,
+        *,
+        reflection_type: str = "archive_note",
+        source: str = "dream",
+    ) -> dict[str, Any]:
+        record = {
+            "id": f"ref_{uuid4().hex[:12]}",
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "type": reflection_type,
+            "source": source,
+            "content": strip_think(content.rstrip()) or content.rstrip(),
+        }
+        self._append_jsonl(self.reflections_file, record)
+        return record
+
+    def append_candidate_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "id": observation.get("id") or f"obs_{uuid4().hex[:12]}",
+            "timestamp": observation.get("timestamp")
+            or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "type": observation.get("type", "observation"),
+            "scope": observation.get("scope", ""),
+            "content": observation.get("content", ""),
+            "source": observation.get("source", "dream_inference"),
+            "source_ref": observation.get("source_ref", []),
+            "confidence": observation.get("confidence", 0.5),
+            "evidence_count": observation.get("evidence_count", 1),
+            "status": observation.get("status", "candidate"),
+            "promotion_target": observation.get("promotion_target", "identity.USER_PROFILE"),
+            "reversible": observation.get("reversible", True),
+            "risk": observation.get("risk", "low"),
+        }
+        self._append_jsonl(self.observations_file, record)
+        return record
+
+    def read_candidate_observations(self) -> list[dict[str, Any]]:
+        return self._read_jsonl(self.observations_file)
+
+    def write_candidate_observations(self, entries: list[dict[str, Any]]) -> None:
+        self._write_jsonl(self.observations_file, entries)
+
     # -- JSONL helpers -------------------------------------------------------
 
-    def _read_entries(self) -> list[dict[str, Any]]:
-        """Read all entries from history.jsonl."""
+    def _append_jsonl(self, path: Path, record: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
         except FileNotFoundError:
             pass
         return entries
+
+    def _write_jsonl(self, path: Path, entries: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _read_entries(self) -> list[dict[str, Any]]:
+        """Read all entries from history.jsonl."""
+        return self._read_jsonl(self.history_file)
 
     def _read_last_entry(self) -> dict[str, Any] | None:
         """Read the last entry from the JSONL file efficiently."""
@@ -295,9 +283,7 @@ class MemoryStore:
 
     def _write_entries(self, entries: list[dict[str, Any]]) -> None:
         """Overwrite history.jsonl with the given entries."""
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            for entry in entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._write_jsonl(self.history_file, entries)
 
     # -- dream cursor --------------------------------------------------------
 
@@ -587,6 +573,11 @@ class Dream:
 
         tools = ToolRegistry()
         workspace = self.store.workspace
+        writable_targets = [
+            self.store.current_file,
+            self.store.reflections_file,
+            self.store.observations_file,
+        ]
         # Allow reading builtin skills for reference during skill creation
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
         tools.register(ReadFileTool(
@@ -594,7 +585,11 @@ class Dream:
             allowed_dir=workspace,
             extra_allowed_dirs=extra_read,
         ))
-        tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
+        tools.register(EditFileTool(
+            workspace=workspace,
+            allowed_dir=workspace,
+            writable_targets=writable_targets,
+        ))
         # write_file resolves relative paths from workspace root, but can only
         # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
         skills_dir = workspace / "skills"
@@ -654,15 +649,23 @@ class Dream:
 
         # Current file contents
         current_date = datetime.now().strftime("%Y-%m-%d")
-        current_memory = self.store.read_memory() or "(empty)"
         current_soul = self.store.read_soul() or "(empty)"
-        current_user = self.store.read_user() or "(empty)"
+        current_user_rules = self.store.read_user_rules() or "(empty)"
+        current_user_profile = self.store.read_user_profile() or "(empty)"
+        current_working = self.store.read_current() or "(empty)"
+        recent_archive = self.store.get_recent_history_context(max_entries=self.max_batch_size) or "(empty)"
+        recent_reflections = self.store.get_recent_reflections_context(max_entries=10) or "(empty)"
+        current_candidates = self.store.get_candidate_context(max_entries=10) or "(empty)"
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
-            f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
-            f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
+            f"## Current identity/SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
+            f"## Current identity/USER_RULES.md ({len(current_user_rules)} chars)\n{current_user_rules}\n\n"
+            f"## Current identity/USER_PROFILE.md ({len(current_user_profile)} chars)\n{current_user_profile}\n\n"
+            f"## Current working/CURRENT.md ({len(current_working)} chars)\n{current_working}\n\n"
+            f"## Recent archive/history.jsonl\n{recent_archive}\n\n"
+            f"## Recent archive/reflections.jsonl\n{recent_reflections}\n\n"
+            f"## Recent candidate/observations.jsonl\n{current_candidates}"
         )
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)

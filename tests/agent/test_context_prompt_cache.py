@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -54,11 +53,12 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
 
     prompt = builder.build_system_prompt()
 
-    assert "memory/history.jsonl" in prompt
-    assert "automatically managed by Dream" in prompt
-    assert "do not edit directly" in prompt
-    assert "memory/HISTORY.md" not in prompt
-    assert "write important facts here" not in prompt
+    assert "identity/" in prompt
+    assert "working/CURRENT.md" in prompt
+    assert "archive/history.jsonl" in prompt
+    assert "candidate/observations.jsonl" in prompt
+    assert "memory/history.jsonl" not in prompt
+    assert "memory/MEMORY.md" not in prompt
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
@@ -87,8 +87,8 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Return exactly: OK" in user_content
 
 
-def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
-    """Entries in history.jsonl not yet consumed by Dream appear with timestamps."""
+def test_archive_history_is_not_injected_into_system_prompt(tmp_path) -> None:
+    """Archive history should stay searchable, not resident in the system prompt."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -96,56 +96,28 @@ def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
     builder.memory.append_history("Agent fetched forecast via web_search")
 
     prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
-    assert "User asked about weather in Tokyo" in prompt
-    assert "Agent fetched forecast via web_search" in prompt
-    assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]", prompt)
-
-
-def test_recent_history_capped_at_max(tmp_path) -> None:
-    """Only the most recent _MAX_RECENT_HISTORY entries are injected."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    for i in range(builder._MAX_RECENT_HISTORY + 20):
-        builder.memory.append_history(f"entry-{i}")
-
-    prompt = builder.build_system_prompt()
-    assert "entry-0" not in prompt
-    assert "entry-19" not in prompt
-    assert f"entry-{builder._MAX_RECENT_HISTORY + 19}" in prompt
-
-
-def test_no_recent_history_when_dream_has_processed_all(tmp_path) -> None:
-    """If Dream has consumed everything, no Recent History section should appear."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    cursor = builder.memory.append_history("already processed entry")
-    builder.memory.set_last_dream_cursor(cursor)
-
-    prompt = builder.build_system_prompt()
     assert "# Recent History" not in prompt
+    assert "User asked about weather in Tokyo" not in prompt
+    assert "Agent fetched forecast via web_search" not in prompt
 
 
-def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
-    """When Dream has processed some entries, only the unprocessed ones appear."""
+def test_identity_and_working_memory_are_injected(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
+    from nanobot.utils.helpers import sync_workspace_templates
+
+    sync_workspace_templates(workspace, silent=True)
+    (workspace / "identity" / "SOUL.md").write_text("# Soul\n\nStay calm.", encoding="utf-8")
+    (workspace / "identity" / "USER_RULES.md").write_text("# User Rules\n\n- Reply in Chinese.", encoding="utf-8")
+    (workspace / "working" / "CURRENT.md").write_text("# Current\n\n- Refactoring memory.", encoding="utf-8")
+
     builder = ContextBuilder(workspace)
-
-    c1 = builder.memory.append_history("old conversation about Python")
-    c2 = builder.memory.append_history("old conversation about Rust")
-    builder.memory.append_history("recent question about Docker")
-    builder.memory.append_history("recent question about K8s")
-
-    builder.memory.set_last_dream_cursor(c2)
-
     prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
-    assert "old conversation about Python" not in prompt
-    assert "old conversation about Rust" not in prompt
-    assert "recent question about Docker" in prompt
-    assert "recent question about K8s" in prompt
+
+    assert "# Identity Memory" in prompt
+    assert "Stay calm." in prompt
+    assert "Reply in Chinese." in prompt
+    assert "# Working Memory" in prompt
+    assert "Refactoring memory." in prompt
 
 
 def test_execution_rules_in_system_prompt(tmp_path) -> None:
@@ -239,35 +211,23 @@ def test_always_skills_excluded_from_skills_index(tmp_path) -> None:
         assert "**memory**" not in index_text
 
 
-def test_template_memory_md_is_skipped(tmp_path) -> None:
-    """MEMORY.md matching the bundled template should not inject the Memory section."""
+def test_removed_legacy_memory_files_do_not_affect_system_prompt(tmp_path) -> None:
+    """Removed legacy memory files should not affect the system prompt."""
     workspace = _make_workspace(tmp_path)
     from nanobot.utils.helpers import sync_workspace_templates
     sync_workspace_templates(workspace, silent=True)
 
-    builder = ContextBuilder(workspace)
-    prompt = builder.build_system_prompt()
-
-    # The "# Memory\n\n## Long-term Memory" block is produced only by
-    # build_system_prompt() when MEMORY.md is injected.  The memory skill
-    # also contains "# Memory" but is followed by "## Structure", not
-    # "## Long-term Memory".
-    assert "# Memory\n\n## Long-term Memory" not in prompt
-    assert "This file is automatically updated by nanobot" not in prompt
-
-
-def test_customized_memory_md_is_injected(tmp_path) -> None:
-    """A Dream-populated MEMORY.md should be injected normally."""
-    workspace = _make_workspace(tmp_path)
-    from nanobot.utils.helpers import sync_workspace_templates
-    sync_workspace_templates(workspace, silent=True)
-
+    (workspace / "SOUL.md").write_text("# Soul\n\nLegacy soul.\n", encoding="utf-8")
+    (workspace / "USER.md").write_text("# User\n\nLegacy user.\n", encoding="utf-8")
+    (workspace / "memory").mkdir()
     (workspace / "memory" / "MEMORY.md").write_text(
         "# Long-term Memory\n\nUser prefers dark mode.\n", encoding="utf-8"
     )
-
     builder = ContextBuilder(workspace)
     prompt = builder.build_system_prompt()
 
-    assert "# Memory\n\n## Long-term Memory" in prompt
-    assert "User prefers dark mode" in prompt
+    assert "SOUL.md" in prompt  # layered identity path listing still exists
+    assert "memory/MEMORY.md" not in prompt
+    assert "User prefers dark mode" not in prompt
+    assert "Legacy soul." not in prompt
+    assert "Legacy user." not in prompt

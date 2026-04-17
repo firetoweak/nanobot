@@ -1781,8 +1781,10 @@ nanobot gateway --config ~/.nanobot-telegram/config.json --workspace /tmp/nanobo
 nanobot uses a layered memory system designed to stay light in the moment and durable over
 time.
 
-- `memory/history.jsonl` stores append-only summarized history
-- `SOUL.md`, `USER.md`, and `memory/MEMORY.md` store long-term knowledge managed by Dream
+- `identity/SOUL.md`, `identity/USER_RULES.md`, and `identity/USER_PROFILE.md` store durable identity and user context
+- `working/CURRENT.md` stores active handoff and short-lived working state
+- `archive/history.jsonl` stores append-only summarized history, and `archive/reflections.jsonl` stores durable reflections
+- `candidate/observations.jsonl` stores promotion candidates and unverified observations awaiting review
 - `Dream` can also promote repeated workflows into reusable workspace skills under `skills/`
 - `Dream` runs on a schedule and can also be triggered manually
 - memory changes can be inspected and restored with built-in commands

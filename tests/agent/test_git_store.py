@@ -6,7 +6,12 @@ from pathlib import Path
 from nanobot.utils.gitstore import GitStore, CommitInfo
 
 
-TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
+TRACKED = [
+    "identity/SOUL.md",
+    "identity/USER_RULES.md",
+    "identity/USER_PROFILE.md",
+    "working/CURRENT.md",
+]
 
 
 @pytest.fixture
@@ -54,7 +59,9 @@ class TestInit:
 class TestBuildGitignore:
     def test_subdirectory_dirs(self, git):
         content = git._build_gitignore()
-        assert "!memory/\n" in content
+        assert "!identity/\n" in content
+        assert "!working/\n" in content
+        assert "!memory/\n" not in content
         for f in TRACKED:
             assert f"!{f}\n" in content
         assert content.startswith("/*\n")
@@ -73,7 +80,7 @@ class TestAutoCommit:
         assert git.auto_commit("test") is None
 
     def test_commits_file_change(self, git_ready):
-        (git_ready._workspace / "SOUL.md").write_text("updated", encoding="utf-8")
+        (git_ready._workspace / "identity" / "SOUL.md").write_text("updated", encoding="utf-8")
         sha = git_ready.auto_commit("update soul")
         assert sha is not None
         assert len(sha) == 8
@@ -83,7 +90,7 @@ class TestAutoCommit:
 
     def test_commit_appears_in_log(self, git_ready):
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("v2", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("v2", encoding="utf-8")
         sha = git_ready.auto_commit("update soul")
         commits = git_ready.log()
         assert len(commits) == 2
@@ -102,7 +109,7 @@ class TestLog:
     def test_newest_first(self, git_ready):
         ws = git_ready._workspace
         for i in range(3):
-            (ws / "SOUL.md").write_text(f"v{i}", encoding="utf-8")
+            (ws / "identity" / "SOUL.md").write_text(f"v{i}", encoding="utf-8")
             git_ready.auto_commit(f"commit {i}")
 
         commits = git_ready.log()
@@ -113,7 +120,7 @@ class TestLog:
     def test_max_entries(self, git_ready):
         ws = git_ready._workspace
         for i in range(10):
-            (ws / "SOUL.md").write_text(f"v{i}", encoding="utf-8")
+            (ws / "identity" / "SOUL.md").write_text(f"v{i}", encoding="utf-8")
             git_ready.auto_commit(f"c{i}")
         assert len(git_ready.log(max_entries=3)) == 3
 
@@ -131,9 +138,9 @@ class TestDiffCommits:
 
     def test_diff_between_two_commits(self, git_ready):
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("original", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("original", encoding="utf-8")
         git_ready.auto_commit("v1")
-        (ws / "SOUL.md").write_text("modified", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("modified", encoding="utf-8")
         git_ready.auto_commit("v2")
 
         commits = git_ready.log()
@@ -147,7 +154,7 @@ class TestDiffCommits:
 class TestFindCommit:
     def test_finds_by_prefix(self, git_ready):
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("v2", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("v2", encoding="utf-8")
         sha = git_ready.auto_commit("v2")
         found = git_ready.find_commit(sha[:4])
         assert found is not None
@@ -160,7 +167,7 @@ class TestFindCommit:
 class TestShowCommitDiff:
     def test_returns_commit_with_diff(self, git_ready):
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("content", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("content", encoding="utf-8")
         sha = git_ready.auto_commit("add content")
         result = git_ready.show_commit_diff(sha)
         assert result is not None
@@ -202,15 +209,15 @@ class TestRevert:
     def test_undoes_commit_changes(self, git_ready):
         """revert(sha) should undo the given commit by restoring to its parent."""
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("v2 content", encoding="utf-8")
+        (ws / "identity" / "SOUL.md").write_text("v2 content", encoding="utf-8")
         git_ready.auto_commit("v2")
 
         commits = git_ready.log()
         # commits[0] = v2 (HEAD), commits[1] = init
-        # Revert v2 → restore to init's state (empty SOUL.md)
+        # Revert v2 → restore to init's state (empty identity/SOUL.md)
         new_sha = git_ready.revert(commits[0].sha)
         assert new_sha is not None
-        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+        assert (ws / "identity" / "SOUL.md").read_text(encoding="utf-8") == ""
 
     def test_root_commit_returns_none(self, git_ready):
         """Cannot revert the root commit (no parent to restore to)."""

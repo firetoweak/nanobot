@@ -16,7 +16,7 @@ from nanobot.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
@@ -32,16 +32,20 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, working state, bootstrap files, and skills."""
         parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+        identity = self.memory.get_identity_context()
+        if identity:
+            parts.append(f"# Identity Memory\n\n{identity}")
+
+        working = self.memory.get_working_context()
+        if working:
+            parts.append(f"# Working Memory\n\n{working}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -52,13 +56,6 @@ class ContextBuilder:
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
-
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
-        if entries:
-            capped = entries[-self._MAX_RECENT_HISTORY:]
-            parts.append("# Recent History\n\n" + "\n".join(
-                f"- [{e['timestamp']}] {e['content']}" for e in capped
-            ))
 
         return "\n\n---\n\n".join(parts)
 

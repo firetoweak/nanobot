@@ -13,8 +13,9 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 def store(tmp_path):
     s = MemoryStore(tmp_path)
     s.write_soul("# Soul\n- Helpful")
-    s.write_user("# User\n- Developer")
-    s.write_memory("# Memory\n- Project X active")
+    s.write_user_rules("# User Rules\n- Reply briefly")
+    s.write_user_profile("# User Profile\n- Developer")
+    s.write_current("# Current\n- Active refactor")
     return s
 
 
@@ -66,7 +67,7 @@ class TestDreamRun:
         store.append_history("User prefers dark mode")
         mock_provider.chat_with_retry.return_value = MagicMock(content="New fact")
         mock_runner.run = AsyncMock(return_value=_make_run_result(
-            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "candidate/observations.jsonl"}],
         ))
         result = await dream.run()
         assert result is True
@@ -74,6 +75,19 @@ class TestDreamRun:
         spec = mock_runner.run.call_args[0][0]
         assert spec.max_iterations == 10
         assert spec.fail_on_tool_error is False
+        assert "memory/MEMORY.md" not in spec.initial_messages[1]["content"]
+
+    async def test_dream_tools_cannot_write_identity_files(self, dream, store):
+        edit_tool = dream._tools.get("edit_file")
+        assert edit_tool is not None
+
+        result = await edit_tool.execute(
+            path="identity/SOUL.md",
+            old_text="",
+            new_text="# Soul\n- Mutated",
+        )
+
+        assert result.startswith("Error:")
 
     async def test_advances_dream_cursor(self, dream, mock_provider, mock_runner, store):
         """Dream should advance the cursor after processing."""

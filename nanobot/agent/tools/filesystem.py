@@ -48,13 +48,23 @@ class _FsTool(Tool):
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
+        writable_targets: list[Path] | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        self._writable_targets = [p.resolve() for p in (writable_targets or [])]
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
+
+    def _ensure_writable(self, path: Path) -> None:
+        if not self._writable_targets:
+            return
+        if any(path == target or _is_under(path, target) for target in self._writable_targets):
+            return
+        allowed = ", ".join(str(target) for target in self._writable_targets)
+        raise PermissionError(f"Writing to {path} is not allowed. Allowed targets: {allowed}")
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +297,7 @@ class WriteFileTool(_FsTool):
             if content is None:
                 raise ValueError("Unknown content")
             fp = self._resolve(path)
+            self._ensure_writable(fp)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             file_state.record_write(fp)
@@ -617,6 +628,7 @@ class EditFileTool(_FsTool):
                 return "Error: This is a Jupyter notebook. Use the notebook_edit tool instead of edit_file."
 
             fp = self._resolve(path)
+            self._ensure_writable(fp)
 
             # Create-file semantics: old_text='' + file doesn't exist → create
             if not fp.exists():

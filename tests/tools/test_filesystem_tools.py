@@ -4,6 +4,7 @@ import pytest
 
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
+    WriteFileTool,
     ListDirTool,
     ReadFileTool,
     _find_match,
@@ -211,6 +212,33 @@ class TestEditFileTool:
         f.write_text("hello", encoding="utf-8")
         result = await tool.execute(path=str(f), old_text="hello")
         assert result == "Error editing file: Unknown new_text"
+
+    @pytest.mark.asyncio
+    async def test_writable_targets_block_disallowed_paths(self, tmp_path):
+        allowed = tmp_path / "working" / "CURRENT.md"
+        allowed.parent.mkdir(parents=True)
+        tool = EditFileTool(workspace=tmp_path, writable_targets=[allowed])
+        disallowed = tmp_path / "identity" / "SOUL.md"
+        disallowed.parent.mkdir(parents=True)
+        disallowed.write_text("old", encoding="utf-8")
+
+        result = await tool.execute(path=str(disallowed), old_text="old", new_text="new")
+
+        assert result.startswith("Error:")
+
+
+class TestWriteFileTool:
+
+    @pytest.mark.asyncio
+    async def test_writable_targets_allow_only_configured_files(self, tmp_path):
+        allowed = tmp_path / "archive" / "reflections.jsonl"
+        tool = WriteFileTool(workspace=tmp_path, writable_targets=[allowed])
+
+        ok = await tool.execute(path=str(allowed), content="{}\n")
+        denied = await tool.execute(path=str(tmp_path / "identity" / "SOUL.md"), content="blocked")
+
+        assert "Successfully wrote" in ok
+        assert denied.startswith("Error:")
 
 
 # ---------------------------------------------------------------------------

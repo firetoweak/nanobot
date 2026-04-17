@@ -688,6 +688,45 @@ def gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
     )
+    heartbeat_agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+        web_config=config.tools.web,
+        context_block_limit=config.agents.defaults.context_block_limit,
+        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
+        provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        exec_config=config.tools.exec,
+        cron_service=None,
+        restrict_to_workspace=True,
+        session_manager=session_manager,
+        mcp_servers=None,
+        channels_config=config.channels,
+        timezone=config.agents.defaults.timezone,
+        unified_session=config.agents.defaults.unified_session,
+        disabled_skills=config.agents.defaults.disabled_skills,
+        session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+    )
+    for tool_name in ("write_file", "edit_file", "exec", "spawn", "cron", "message", "notebook_edit"):
+        heartbeat_agent.tools.unregister(tool_name)
+    from nanobot.agent.tools.filesystem import EditFileTool, WriteFileTool
+    heartbeat_writable_targets = [
+        config.workspace_path / "working" / "CURRENT.md",
+        config.workspace_path / "archive" / "reflections.jsonl",
+    ]
+    heartbeat_agent.tools.register(WriteFileTool(
+        workspace=config.workspace_path,
+        allowed_dir=config.workspace_path,
+        writable_targets=heartbeat_writable_targets,
+    ))
+    heartbeat_agent.tools.register(EditFileTool(
+        workspace=config.workspace_path,
+        allowed_dir=config.workspace_path,
+        writable_targets=heartbeat_writable_targets,
+    ))
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
@@ -699,6 +738,13 @@ def gateway(
                 logger.info("Dream cron job completed")
             except Exception:
                 logger.exception("Dream cron job failed")
+            return None
+        if job.name == "promoter":
+            try:
+                changed = agent.promoter.run()
+                logger.info("Promoter cron job completed (changed={})", changed)
+            except Exception:
+                logger.exception("Promoter cron job failed")
             return None
 
         from nanobot.agent.tools.cron import CronTool
@@ -774,7 +820,7 @@ def gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        resp = await agent.process_direct(
+        resp = await heartbeat_agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
@@ -784,9 +830,9 @@ def gateway(
 
         # Keep a small tail of heartbeat history so the loop stays bounded
         # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
+        session = heartbeat_agent.sessions.get_or_create("heartbeat")
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
-        agent.sessions.save(session)
+        heartbeat_agent.sessions.save(session)
 
         return resp.content if resp else ""
 
@@ -876,7 +922,14 @@ def gateway(
         schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
         payload=CronPayload(kind="system_event"),
     ))
+    cron.register_system_job(CronJob(
+        id="promoter",
+        name="promoter",
+        schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
+        payload=CronPayload(kind="system_event"),
+    ))
     console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    console.print(f"[green]✓[/green] Promoter: {dream_cfg.describe_schedule()}")
 
     async def run():
         try:

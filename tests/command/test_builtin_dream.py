@@ -57,9 +57,9 @@ def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int
 async def test_dream_log_latest_is_more_user_friendly() -> None:
     commit = CommitInfo(sha="abcd1234", message="dream: 2026-04-04, 2 change(s)", timestamp="2026-04-04 12:00")
     diff = (
-        "diff --git a/SOUL.md b/SOUL.md\n"
-        "--- a/SOUL.md\n"
-        "+++ b/SOUL.md\n"
+        "diff --git a/identity/SOUL.md b/identity/SOUL.md\n"
+        "--- a/identity/SOUL.md\n"
+        "+++ b/identity/SOUL.md\n"
         "@@ -1 +1 @@\n"
         "-old\n"
         "+new\n"
@@ -71,7 +71,7 @@ async def test_dream_log_latest_is_more_user_friendly() -> None:
     assert "## Dream Update" in out.content
     assert "Here is the latest Dream memory change." in out.content
     assert "- Commit: `abcd1234`" in out.content
-    assert "- Changed files: `SOUL.md`" in out.content
+    assert "- Changed files: `identity/SOUL.md`" in out.content
     assert "Use `/dream-restore abcd1234` to undo this change." in out.content
     assert "```diff" in out.content
 
@@ -117,15 +117,15 @@ async def test_dream_restore_lists_versions_with_next_steps() -> None:
 async def test_dream_restore_success_mentions_files_and_followup() -> None:
     commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
     diff = (
-        "diff --git a/SOUL.md b/SOUL.md\n"
-        "--- a/SOUL.md\n"
-        "+++ b/SOUL.md\n"
+        "diff --git a/identity/SOUL.md b/identity/SOUL.md\n"
+        "--- a/identity/SOUL.md\n"
+        "+++ b/identity/SOUL.md\n"
         "@@ -1 +1 @@\n"
         "-old\n"
         "+new\n"
-        "diff --git a/memory/MEMORY.md b/memory/MEMORY.md\n"
-        "--- a/memory/MEMORY.md\n"
-        "+++ b/memory/MEMORY.md\n"
+        "diff --git a/working/CURRENT.md b/working/CURRENT.md\n"
+        "--- a/working/CURRENT.md\n"
+        "+++ b/working/CURRENT.md\n"
         "@@ -1 +1 @@\n"
         "-old\n"
         "+new\n"
@@ -139,5 +139,5 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
 
     assert "Restored Dream memory to the state before `abcd1234`." in out.content
     assert "- New safety commit: `eeee9999`" in out.content
-    assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
+    assert "- Restored files: `identity/SOUL.md`, `working/CURRENT.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content

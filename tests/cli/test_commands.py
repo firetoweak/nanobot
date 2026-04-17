@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -66,7 +67,13 @@ def test_onboard_fresh_install(mock_paths):
     assert "nanobot is ready" in result.stdout
     assert config_file.exists()
     assert (workspace_dir / "AGENTS.md").exists()
-    assert (workspace_dir / "memory" / "MEMORY.md").exists()
+    assert (workspace_dir / "identity" / "SOUL.md").exists()
+    assert (workspace_dir / "identity" / "USER_PROFILE.md").exists()
+    assert (workspace_dir / "identity" / "USER_RULES.md").exists()
+    assert (workspace_dir / "working" / "CURRENT.md").exists()
+    assert not (workspace_dir / "SOUL.md").exists()
+    assert not (workspace_dir / "USER.md").exists()
+    assert not (workspace_dir / "memory" / "MEMORY.md").exists()
     expected_workspace = Config().workspace_path
     assert mock_ws.call_args.args == (expected_workspace,)
 
@@ -868,6 +875,133 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
 
 
+def test_gateway_builds_restricted_heartbeat_agent_and_registers_promoter(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    seen: dict[str, object] = {}
+
+    class _FakeTools:
+        def __init__(self) -> None:
+            self.unregistered: list[str] = []
+            self.registered: list[object] = []
+            self._tools = {name: object() for name in (
+                "write_file", "edit_file", "exec", "spawn", "cron", "message", "notebook_edit"
+            )}
+
+        def unregister(self, name: str) -> None:
+            self.unregistered.append(name)
+            self._tools.pop(name, None)
+
+        def register(self, tool) -> None:
+            self.registered.append(tool)
+            self._tools[tool.name] = tool
+
+        def get(self, name: str):
+            return self._tools.get(name)
+
+    class _FakeAgentLoop:
+        instances: list["_FakeAgentLoop"] = []
+
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.model = "test-model"
+            self.dream = SimpleNamespace(model=None, max_batch_size=0, max_iterations=0)
+            self.promoter = SimpleNamespace(run=lambda: False)
+            self.sessions = SimpleNamespace(
+                get_or_create=lambda _key: SimpleNamespace(retain_recent_legal_suffix=lambda _n: None),
+                save=lambda _session: None,
+            )
+            self.tools = _FakeTools()
+            _FakeAgentLoop.instances.append(self)
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def close_mcp(self) -> None:
+            return None
+
+        async def process_direct(self, *args, **kwargs):
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus) -> None:
+            self.enabled_channels = []
+
+        async def start_all(self) -> None:
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, job) -> None:
+            jobs = seen.setdefault("jobs", [])
+            assert isinstance(jobs, list)
+            jobs.append(job.name)
+            if len(jobs) >= 2:
+                raise _StopGatewayError("stop")
+
+    class _FakeHeartbeatService:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=lambda: object(),
+        session_manager=lambda _workspace: object(),
+    )
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert isinstance(result.exception, _StopGatewayError)
+    assert seen["jobs"] == ["dream", "promoter"]
+    assert len(_FakeAgentLoop.instances) == 2
+
+    heartbeat_agent = _FakeAgentLoop.instances[1]
+    assert heartbeat_agent.kwargs["restrict_to_workspace"] is True
+    assert heartbeat_agent.kwargs["mcp_servers"] is None
+    assert set(heartbeat_agent.tools.unregistered) >= {
+        "write_file", "edit_file", "exec", "spawn", "cron", "message", "notebook_edit"
+    }
+    registered_names = [tool.name for tool in heartbeat_agent.tools.registered]
+    assert registered_names.count("write_file") == 1
+    assert registered_names.count("edit_file") == 1
+    writable_targets = {
+        str(target)
+        for tool in heartbeat_agent.tools.registered
+        if getattr(tool, "name", "") == "edit_file"
+        for target in getattr(tool, "_writable_targets", [])
+    }
+    assert str(config.workspace_path / "working" / "CURRENT.md") in writable_targets
+    assert str(config.workspace_path / "archive" / "reflections.jsonl") in writable_targets
+
+
 def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -894,10 +1028,29 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
             self.on_job = None
             seen["cron"] = self
 
+    class _FakeTools:
+        def __init__(self) -> None:
+            self._tools = {}
+
+        def unregister(self, name: str) -> None:
+            self._tools.pop(name, None)
+
+        def register(self, tool) -> None:
+            self._tools[tool.name] = tool
+
+        def get(self, name: str):
+            return self._tools.get(name)
+
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             self.model = "test-model"
-            self.tools = {}
+            self.tools = _FakeTools()
+            self.dream = SimpleNamespace(model=None, max_batch_size=0, max_iterations=0)
+            self.promoter = SimpleNamespace(run=lambda: False)
+            self.sessions = SimpleNamespace(
+                get_or_create=lambda _key: SimpleNamespace(retain_recent_legal_suffix=lambda _n: None),
+                save=lambda _session: None,
+            )
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(
@@ -1142,10 +1295,29 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
         async def run(self) -> None:
             return None
 
+    class _FakeTools:
+        def __init__(self) -> None:
+            self._tools = {}
+
+        def unregister(self, name: str) -> None:
+            self._tools.pop(name, None)
+
+        def register(self, tool) -> None:
+            self._tools[tool.name] = tool
+
+        def get(self, name: str):
+            return self._tools.get(name)
+
     class _FakeAgentLoop:
         def __init__(self, **_kwargs) -> None:
             self.model = "test-model"
             self.dream = _FakeDream()
+            self.promoter = SimpleNamespace(run=lambda: False)
+            self.sessions = SimpleNamespace(
+                get_or_create=lambda _key: SimpleNamespace(retain_recent_legal_suffix=lambda _n: None),
+                save=lambda _session: None,
+            )
+            self.tools = _FakeTools()
 
         async def run(self) -> None:
             await asyncio.Event().wait()

@@ -1,4 +1,4 @@
-"""Tests for the lightweight Consolidator — append-only to HISTORY.md."""
+"""Tests for the lightweight Consolidator — append-only to archive/history.jsonl."""
 
 import pytest
 import asyncio
@@ -37,7 +37,7 @@ def consolidator(store, mock_provider):
 
 class TestConsolidatorSummarize:
     async def test_summarize_appends_to_history(self, consolidator, mock_provider, store):
-        """Consolidator should call LLM to summarize, then append to HISTORY.md."""
+        """Consolidator should call LLM to summarize, then append to archive/history.jsonl."""
         mock_provider.chat_with_retry.return_value = MagicMock(
             content="User fixed a bug in the auth module."
         )
@@ -51,7 +51,7 @@ class TestConsolidatorSummarize:
         assert len(entries) == 1
 
     async def test_summarize_raw_dumps_on_llm_failure(self, consolidator, mock_provider, store):
-        """On LLM failure, raw-dump messages to HISTORY.md."""
+        """On LLM failure, raw-dump messages to archive/history.jsonl."""
         mock_provider.chat_with_retry.side_effect = Exception("API error")
         messages = [{"role": "user", "content": "hello"}]
         result = await consolidator.archive(messages)

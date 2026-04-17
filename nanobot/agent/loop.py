@@ -17,6 +17,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.promoter import Promoter
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
@@ -241,6 +242,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
         )
+        self.promoter = Promoter(store=self.context.memory)
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
