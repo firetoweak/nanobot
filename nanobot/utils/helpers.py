@@ -1,6 +1,7 @@
 """Utility functions for nanobot."""
 
 import base64
+import hashlib
 import json
 import re
 import shutil
@@ -100,6 +101,27 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n... (truncated)"
 
 
+def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
+    """Serialize JSON with stable key ordering."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=indent)
+
+
+def sha256_text(text: str) -> str:
+    """Return the sha256 hex digest for text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """Atomically replace *path* with *content*."""
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
 def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
     """Find the first index whose tool results have matching assistant calls."""
     declared: set[str] = set()
@@ -178,13 +200,7 @@ def _cleanup_tool_result_buckets(root: Path, current_bucket: Path) -> None:
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(path)
-    finally:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
+    write_text_atomic(path, content)
 
 
 def maybe_persist_tool_result(
@@ -223,7 +239,7 @@ def maybe_persist_tool_result(
     path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
     if not path.exists():
         if suffix == "json" and isinstance(content, list):
-            _write_text_atomic(path, json.dumps(content, ensure_ascii=False, indent=2))
+            _write_text_atomic(path, stable_json_dumps(content, indent=2))
         else:
             _write_text_atomic(path, text_payload)
 

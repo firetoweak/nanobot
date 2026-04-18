@@ -44,6 +44,22 @@ def _make_loop(tmp_path):
     return loop
 
 
+class _RecordingToolSink:
+    def __init__(self) -> None:
+        self.declared: list[tuple[str, list[dict]]] = []
+        self.completed: list[tuple[str, dict]] = []
+        self.artifacts: list[tuple[str, dict]] = []
+
+    async def on_declared_tool_calls(self, turn_id: str, tool_calls: list[dict]) -> None:
+        self.declared.append((turn_id, tool_calls))
+
+    async def on_completed_tool_result(self, turn_id: str, result: dict) -> None:
+        self.completed.append((turn_id, result))
+
+    async def on_artifact_persisted(self, turn_id: str, artifact: dict) -> None:
+        self.artifacts.append((turn_id, artifact))
+
+
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
@@ -435,7 +451,7 @@ async def test_runner_replaces_empty_tool_result_with_marker():
 
 
 @pytest.mark.asyncio
-async def test_runner_uses_raw_messages_when_context_governance_fails():
+async def test_runner_uses_raw_messages_when_tool_budget_normalization_fails():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
@@ -454,7 +470,7 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
     ]
 
     runner = AgentRunner(provider)
-    runner._snip_history = MagicMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
+    runner._apply_tool_result_budget = MagicMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
     result = await runner.run(AgentRunSpec(
         initial_messages=initial_messages,
         tools=tools,
@@ -600,55 +616,6 @@ async def test_runner_empty_response_does_not_break_tool_chain():
     assert "read_file" in result.tools_used
 
 
-def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch):
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
-
-    provider = MagicMock()
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    runner = AgentRunner(provider)
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "old user"},
-        {
-            "role": "assistant",
-            "content": "tool call",
-            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "tool output"},
-        {"role": "assistant", "content": "after tool"},
-    ]
-    spec = AgentRunSpec(
-        initial_messages=messages,
-        tools=tools,
-        model="test-model",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        context_window_tokens=2000,
-        context_block_limit=100,
-    )
-
-    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", lambda *_args, **_kwargs: (500, None))
-    token_sizes = {
-        "old user": 120,
-        "tool call": 120,
-        "tool output": 40,
-        "after tool": 40,
-        "system": 0,
-    }
-    monkeypatch.setattr(
-        "nanobot.agent.runner.estimate_message_tokens",
-        lambda msg: token_sizes.get(str(msg.get("content")), 40),
-    )
-
-    trimmed = runner._snip_history(spec, messages)
-
-    assert trimmed == [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "after tool"},
-    ]
-
-
 @pytest.mark.asyncio
 async def test_runner_keeps_going_when_tool_result_persistence_fails():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
@@ -686,6 +653,157 @@ async def test_runner_keeps_going_when_tool_result_persistence_fails():
     assert result.final_content == "done"
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert tool_message["content"] == "tool result"
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_structured_tool_checkpoints_and_sink_events(tmp_path):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.session.state_store import StateStore
+
+    provider = MagicMock()
+    checkpoints: list[dict] = []
+    sink = _RecordingToolSink()
+    call_count = {"n": 0}
+
+    target = tmp_path / "note.txt"
+    target.write_text("artifact body", encoding="utf-8")
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="use tool",
+                tool_calls=[ToolCallRequest(id="call_art", name="read_file", arguments={"path": str(target)})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    async def checkpoint_callback(payload):
+        checkpoints.append(payload)
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="artifact body")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "read it"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        workspace=tmp_path,
+        session_key="cli:test",
+        turn_id="turn_art",
+        active_revision=7,
+        checkpoint_callback=checkpoint_callback,
+        tool_execution_sink=sink,
+    ))
+
+    assert result.final_content == "done"
+    assert sink.declared and sink.completed and sink.artifacts
+    declared_turn, declared_calls = sink.declared[0]
+    assert declared_turn == "turn_art"
+    assert declared_calls[0]["declared_revision"] == 7
+
+    artifact_turn, artifact = sink.artifacts[0]
+    assert artifact_turn == "turn_art"
+    assert artifact["declared_revision"] == 7
+    assert artifact["source_type"] == "read_file"
+    assert artifact["content_version"]
+    assert artifact["artifact_ref"].startswith("artifact:")
+
+    completed_turn, completed_result = sink.completed[0]
+    assert completed_turn == "turn_art"
+    assert completed_result["declared_revision"] == 7
+    assert completed_result["artifact_ref"] == artifact["artifact_ref"]
+
+    awaiting_tools = next(item for item in checkpoints if item["phase"] == "awaiting_tools")
+    assert awaiting_tools["pending_tool_calls"][0]["declared_revision"] == 7
+    tools_completed = next(item for item in checkpoints if item["phase"] == "tools_completed")
+    assert tools_completed["completed_tool_results"][0]["artifact_ref"] == artifact["artifact_ref"]
+
+    persisted = StateStore(tmp_path).resolve_ref("cli:test", artifact["artifact_ref"])
+    assert persisted is not None
+    assert persisted["artifact_id"] == artifact["artifact_id"]
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_stale_tool_results_as_audit_only_artifacts(tmp_path):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    sink = _RecordingToolSink()
+    call_count = {"n": 0}
+    revisions = iter([3, 4])
+
+    target = tmp_path / "stale.txt"
+    target.write_text("old body", encoding="utf-8")
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="use tool",
+                tool_calls=[ToolCallRequest(id="call_stale", name="read_file", arguments={"path": str(target)})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    async def revision_provider():
+        return next(revisions)
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="old body")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "read it"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        workspace=tmp_path,
+        session_key="cli:test",
+        turn_id="turn_stale",
+        active_revision=3,
+        revision_provider=revision_provider,
+        tool_execution_sink=sink,
+    ))
+
+    assert result.final_content == "done"
+    assert sink.declared and sink.artifacts
+    assert sink.completed == []
+    artifact = sink.artifacts[0][1]
+    assert artifact["eligible_for_commit"] is False
+    assert "stale_revision" in artifact["invalidated_by"]
+    tool_message = next(message for message in result.messages if message.get("role") == "tool")
+    assert tool_message["stale"] is True
+    assert tool_message["eligible_for_commit"] is False
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_tool_sink_without_turn_context():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="done", tool_calls=[], usage={}))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    with pytest.raises(ValueError, match="ToolExecutionSink requires turn_id and session_key context"):
+        await runner.run(AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            tool_execution_sink=_RecordingToolSink(),
+        ))
 
 
 class _DelayTool(Tool):
@@ -1030,13 +1148,16 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
 
     request_messages = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
     non_system = [message for message in request_messages if message.get("role") != "system"]
-    assert non_system[0] == {"role": "user", "content": "first question"}
-    assert non_system[1] == {
+    assert non_system[0]["role"] == "user"
+    assert "[Working Set Snapshot]" in non_system[0]["content"]
+    assert "first question" in non_system[0]["content"]
+    assert non_system[1] == {"role": "user", "content": "first question"}
+    assert non_system[2] == {
         "role": "assistant",
         "content": _PERSISTED_MODEL_ERROR_PLACEHOLDER,
     }
-    assert non_system[2]["role"] == "user"
-    assert "second question" in non_system[2]["content"]
+    assert non_system[3]["role"] == "user"
+    assert "second question" in non_system[3]["content"]
 
 
 @pytest.mark.asyncio
@@ -1597,84 +1718,6 @@ async def test_runner_backfill_only_mutates_model_context_not_returned_messages(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Microcompact (stale tool result compaction)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_microcompact_replaces_old_tool_results():
-    """Tool results beyond _MICROCOMPACT_KEEP_RECENT should be summarized."""
-    from nanobot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    long_content = "x" * 600
-    messages: list[dict] = [{"role": "system", "content": "sys"}]
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "read_file",
-            "content": long_content,
-        })
-
-    result = AgentRunner._microcompact(messages)
-    tool_msgs = [m for m in result if m.get("role") == "tool"]
-    stale_count = total - _MICROCOMPACT_KEEP_RECENT
-    compacted = [m for m in tool_msgs if "omitted from context" in str(m.get("content", ""))]
-    preserved = [m for m in tool_msgs if m.get("content") == long_content]
-    assert len(compacted) == stale_count
-    assert len(preserved) == _MICROCOMPACT_KEEP_RECENT
-
-
-@pytest.mark.asyncio
-async def test_microcompact_preserves_short_results():
-    """Short tool results (< _MICROCOMPACT_MIN_CHARS) should not be replaced."""
-    from nanobot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    messages: list[dict] = []
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "exec",
-            "content": "short",
-        })
-
-    result = AgentRunner._microcompact(messages)
-    assert result is messages  # no copy needed — all stale results are short
-
-
-@pytest.mark.asyncio
-async def test_microcompact_skips_non_compactable_tools():
-    """Non-compactable tools (e.g. 'message') should never be replaced."""
-    from nanobot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
-
-    total = _MICROCOMPACT_KEEP_RECENT + 5
-    long_content = "y" * 1000
-    messages: list[dict] = []
-    for i in range(total):
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "message", "arguments": "{}"}}],
-        })
-        messages.append({
-            "role": "tool", "tool_call_id": f"c{i}", "name": "message",
-            "content": long_content,
-        })
-
-    result = AgentRunner._microcompact(messages)
-    assert result is messages  # no compactable tools found
-
-
 @pytest.mark.asyncio
 async def test_runner_tool_error_preserves_tool_results_in_messages():
     """When a tool raises a fatal error, its results must still be appended
@@ -1736,9 +1779,8 @@ async def test_runner_tool_error_preserves_tool_results_in_messages():
     assert all(ti > asst_tc_idx for ti in tool_indices)
 
 
-def test_governance_repairs_orphans_after_snip():
-    """After _snip_history clips an assistant+tool_calls, the second
-    _drop_orphan_tool_results pass must clean up the resulting orphans."""
+def test_governance_repairs_orphans_after_external_history_clipping():
+    """The orphan-repair pass must clean up tool results without declarations."""
     from nanobot.agent.runner import AgentRunner
 
     messages = [
@@ -1753,9 +1795,7 @@ def test_governance_repairs_orphans_after_snip():
         {"role": "user", "content": "new msg"},
     ]
 
-    # Simulate snipping that keeps only the tail: drop the assistant with
-    # tool_calls but keep its tool result (orphan).
-    snipped = [
+    clipped = [
         {"role": "system", "content": "system"},
         {"role": "tool", "tool_call_id": "tc_old", "name": "search",
          "content": "old result"},
@@ -1763,8 +1803,7 @@ def test_governance_repairs_orphans_after_snip():
         {"role": "user", "content": "new msg"},
     ]
 
-    cleaned = AgentRunner._drop_orphan_tool_results(snipped)
-    # The orphan tool result should be removed.
+    cleaned = AgentRunner._drop_orphan_tool_results(clipped)
     assert not any(
         m.get("role") == "tool" and m.get("tool_call_id") == "tc_old"
         for m in cleaned

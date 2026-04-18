@@ -13,6 +13,11 @@ def store(tmp_path):
 
 
 class TestMemoryStoreBasicIO:
+    def test_state_dir_is_initialized_and_current_is_legacy_mirror(self, store):
+        assert store.state_dir.exists()
+        assert store.current_file == store.workspace / "working" / "CURRENT.md"
+        assert store.read_current_mirror() == ""
+
     def test_read_identity_and_working_files_return_empty_when_missing(self, store):
         assert store.read_soul() == ""
         assert store.read_user_rules() == ""
@@ -29,6 +34,12 @@ class TestMemoryStoreBasicIO:
         assert store.read_user_rules() == "rules content"
         assert store.read_user_profile() == "profile content"
         assert store.read_current() == "active task"
+
+    def test_current_mirror_alias_matches_legacy_api(self, store):
+        store.write_current_mirror("mirror content")
+
+        assert store.read_current() == "mirror content"
+        assert store.read_current_mirror() == "mirror content"
 
     def test_get_identity_context_only_uses_layered_identity_files(self, store):
         store.write_soul("# Soul\nStay calm.")

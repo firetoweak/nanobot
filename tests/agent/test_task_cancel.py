@@ -32,6 +32,17 @@ def _make_loop(*, exec_config=None):
     return loop, bus
 
 
+def _make_full_loop(tmp_path: Path) -> tuple:
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    return loop, bus
+
+
 class TestHandleStop:
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
@@ -98,6 +109,46 @@ class TestHandleStop:
 
         assert all(e.is_set() for e in events)
         assert "2 task" in out.content
+
+    @pytest.mark.asyncio
+    async def test_stop_marks_active_turn_interrupted(self, tmp_path: Path):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_stop
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_full_loop(tmp_path)
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        checkpoint_saved = asyncio.Event()
+
+        async def interrupted_run_agent_loop(_initial_messages, *, session=None, **_kwargs):
+            assert session is not None
+            loop._sync_turn_state_from_checkpoint(
+                session,
+                {
+                    "assistant_message": {"role": "assistant", "content": "working"},
+                    "completed_tool_results": [],
+                    "pending_tool_calls": [],
+                },
+            )
+            checkpoint_saved.set()
+            await asyncio.Event().wait()
+
+        loop._run_agent_loop = interrupted_run_agent_loop  # type: ignore[method-assign]
+
+        first_msg = InboundMessage(channel="test", sender_id="u1", chat_id="c-stop", content="keep progress")
+        task = asyncio.create_task(loop._process_message(first_msg))
+        loop._active_tasks[first_msg.session_key] = [task]
+        await asyncio.wait_for(checkpoint_saved.wait(), timeout=1.0)
+
+        stop_msg = InboundMessage(channel="test", sender_id="u1", chat_id="c-stop", content="/stop")
+        ctx = CommandContext(msg=stop_msg, session=None, key=stop_msg.session_key, raw="/stop", loop=loop)
+        out = await cmd_stop(ctx)
+
+        assert "Stopped 1 task" in out.content
+        turn_state = loop.sessions.load_active_turn_state("test:c-stop")
+        assert turn_state is not None
+        assert turn_state["current_stage"] == "interrupted"
 
 
 class TestDispatch:

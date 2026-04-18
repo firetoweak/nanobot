@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
+from nanobot.agent.loop import AgentLoop, UNIFIED_SESSION_KEY
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command.builtin import cmd_new, register_builtin_commands
@@ -40,6 +40,22 @@ def _make_loop(tmp_path: Path, unified_session: bool = False) -> AgentLoop:
 
     with patch("nanobot.agent.loop.SessionManager"), \
          patch("nanobot.agent.loop.SubagentManager") as MockSubMgr, \
+         patch("nanobot.agent.loop.Dream"):
+        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            unified_session=unified_session,
+        )
+    return loop
+
+
+def _make_full_loop(tmp_path: Path, unified_session: bool = False) -> AgentLoop:
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    with patch("nanobot.agent.loop.SubagentManager") as MockSubMgr, \
          patch("nanobot.agent.loop.Dream"):
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(
@@ -146,6 +162,29 @@ class TestUnifiedSessionDispatch:
         """unified_session defaults to False — no behavior change for existing users."""
         loop = _make_loop(tmp_path)
         assert loop._unified_session is False
+
+    @pytest.mark.asyncio
+    async def test_unified_session_persists_active_turn_under_shared_key(self, tmp_path: Path):
+        loop = _make_full_loop(tmp_path, unified_session=True)
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        loop._run_agent_loop = AsyncMock(return_value=(
+            "done",
+            None,
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "stop",
+            False,
+        ))  # type: ignore[method-assign]
+
+        await loop._dispatch(_make_msg(channel="telegram", chat_id="111"))
+
+        assert loop.sessions.load_active_turn_state(UNIFIED_SESSION_KEY) is None
+        latest = loop.sessions.load_latest_turn_state(UNIFIED_SESSION_KEY)
+        assert latest is not None
+        assert latest["session_key"] == UNIFIED_SESSION_KEY
 
 
 # ---------------------------------------------------------------------------

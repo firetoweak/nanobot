@@ -10,6 +10,7 @@ import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from uuid import uuid4
 
 from loguru import logger
 
@@ -36,8 +37,26 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.state import (
+    COMMIT_STATE_COMMITTED,
+    COMMIT_STATE_OPEN,
+    COMMIT_STATE_REPAIR_NEEDED,
+    TURN_STAGE_AWAITING_MODEL,
+    TURN_STAGE_AWAITING_TOOLS,
+    TURN_STAGE_COLLECTING_USER,
+    TURN_STAGE_COMPLETED,
+    TURN_STAGE_FINALIZING,
+    TURN_STAGE_INTERRUPTED,
+    build_turn_state,
+    make_ref,
+    REF_ARTIFACT,
+    REF_CAPSULE,
+    REF_COMMIT,
+    REF_RESPONSE,
+    timestamp as state_timestamp,
+)
 from nanobot.utils.document import extract_documents
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import image_placeholder_text, stringify_text_blocks
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
@@ -130,9 +149,6 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
-
-    _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
-    _PENDING_USER_TURN_KEY = "pending_user_turn"
 
     def __init__(
         self,
@@ -337,6 +353,737 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    @staticmethod
+    def _new_object_id(prefix: str) -> str:
+        return f"{prefix}_{uuid4().hex}"
+
+    def load_active_turn_state(self, session_key: str) -> dict[str, Any] | None:
+        return self.sessions.load_active_turn_state(session_key)
+
+    def create_turn_state(
+        self,
+        session_key: str,
+        *,
+        current_stage: str = TURN_STAGE_COLLECTING_USER,
+    ) -> dict[str, Any]:
+        turn_id = self._new_object_id("turn")
+        turn_state = build_turn_state(
+            session_key=session_key,
+            turn_id=turn_id,
+            current_stage=current_stage,
+        )
+        turn_state["resume_action"] = self.compute_resume_action(turn_state)
+        self.persist_turn_state(
+            turn_state,
+            publish_active=True,
+            publish_latest=True,
+        )
+        return turn_state
+
+    def persist_turn_state(
+        self,
+        turn_state: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+        publish_active: bool = True,
+        publish_latest: bool = False,
+    ) -> dict[str, Any]:
+        persisted = dict(turn_state)
+        persisted["updated_at"] = state_timestamp()
+        self.sessions.save_turn_state(
+            persisted["session_key"],
+            persisted["turn_id"],
+            persisted,
+            expected_revision=expected_revision,
+        )
+        if publish_latest:
+            self.sessions.publish_latest_turn(persisted["session_key"], persisted["turn_id"])
+        if publish_active:
+            if persisted.get("current_stage") == TURN_STAGE_COMPLETED:
+                self.sessions.publish_active_turn(persisted["session_key"], None)
+            else:
+                self.sessions.publish_active_turn(persisted["session_key"], persisted["turn_id"])
+        return persisted
+
+    def compute_resume_action(self, turn_state: dict[str, Any]) -> str | None:
+        stage = turn_state.get("current_stage")
+        declared = turn_state.get("declared_tool_calls") or []
+        completed = turn_state.get("completed_tool_results") or []
+        declared_ids = {
+            tc.get("id")
+            for tc in declared
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        completed_ids = {
+            result.get("tool_call_id")
+            for result in completed
+            if isinstance(result, dict) and result.get("tool_call_id")
+        }
+        pending_tools = bool(declared_ids - completed_ids)
+
+        if stage == TURN_STAGE_AWAITING_TOOLS:
+            return "await_tools" if pending_tools else "request_model_again"
+        if stage == TURN_STAGE_AWAITING_MODEL:
+            return "request_model_again" if (
+                turn_state.get("user_message_ref")
+                or turn_state.get("injected_messages")
+                or completed
+            ) else "replan"
+        if stage == TURN_STAGE_FINALIZING:
+            return "tail_finalize"
+        if stage == TURN_STAGE_INTERRUPTED:
+            if pending_tools:
+                return "await_tools"
+            if completed or turn_state.get("final_response_ref"):
+                return "tail_finalize"
+            if turn_state.get("injected_messages"):
+                return "request_model_again"
+            if turn_state.get("user_message_ref"):
+                return "replan"
+            return "replan"
+        if stage == TURN_STAGE_COMPLETED:
+            return None
+        if stage == TURN_STAGE_COLLECTING_USER:
+            return "tail_finalize" if turn_state.get("user_message_ref") else "replan"
+        return None
+
+    def _advance_turn_state(
+        self,
+        turn_state: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+        publish_active: bool = True,
+        publish_latest: bool = False,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        current_revision = int(turn_state.get("revision", 0))
+        next_state = dict(turn_state)
+        next_state.update(changes)
+        next_state["revision"] = current_revision + 1
+        next_state["resume_action"] = self.compute_resume_action(next_state)
+        return self.persist_turn_state(
+            next_state,
+            expected_revision=current_revision if expected_revision is None else expected_revision,
+            publish_active=publish_active,
+            publish_latest=publish_latest,
+        )
+
+    def _save_message_object(
+        self,
+        *,
+        session_key: str,
+        turn_id: str,
+        role: str,
+        content: Any,
+    ) -> str:
+        message_id = self._new_object_id("msg")
+        self.sessions.save_message_object(
+            session_key,
+            message_id,
+            {
+                "message_id": message_id,
+                "session_key": session_key,
+                "turn_id": turn_id,
+                "role": role,
+                "content": content,
+                "created_at": state_timestamp(),
+            },
+        )
+        return make_ref("message", message_id)
+
+    def _build_message_object_content(self, text: str, media: list[str] | None) -> Any:
+        return self.context._build_user_content(text, media if media else None)
+
+    @staticmethod
+    def _merge_records_by_key(
+        existing: list[dict[str, Any]],
+        incoming: list[dict[str, Any]],
+        *,
+        key: str,
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        positions: dict[Any, int] = {}
+        for record in list(existing) + list(incoming):
+            if not isinstance(record, dict):
+                continue
+            value = record.get(key)
+            item = dict(record)
+            if value in (None, ""):
+                merged.append(item)
+                continue
+            if value in positions:
+                merged[positions[value]] = item
+                continue
+            positions[value] = len(merged)
+            merged.append(item)
+        return merged
+
+    @staticmethod
+    def _merge_refs(existing: list[str], incoming: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for ref in list(existing) + list(incoming):
+            if not isinstance(ref, str) or not ref:
+                continue
+            if ref in seen:
+                continue
+            seen.add(ref)
+            merged.append(ref)
+        return merged
+
+    @staticmethod
+    def _artifact_refs_from_results(results: list[dict[str, Any]]) -> list[str]:
+        refs: list[str] = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            if result.get("eligible_for_commit") is False or result.get("stale") is True:
+                continue
+            artifact_ref = result.get("artifact_ref")
+            if isinstance(artifact_ref, str) and artifact_ref:
+                refs.append(artifact_ref)
+        return refs
+
+    def _content_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text = stringify_text_blocks(content)
+            if text is not None:
+                return text
+            return json.dumps(content, ensure_ascii=False)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _resolve_ref_content_text(self, session_key: str, ref: str | None) -> str:
+        if not isinstance(ref, str) or not ref:
+            return ""
+        resolved = self.sessions.resolve_ref(session_key, ref)
+        if not isinstance(resolved, dict):
+            return ""
+        return self._content_to_text(resolved.get("content"))
+
+    def _latest_working_set_version(self, session_key: str) -> int | None:
+        latest = self.sessions.load_latest_working_set(session_key)
+        if not isinstance(latest, dict):
+            return None
+        version = latest.get("version")
+        return version if isinstance(version, int) else None
+
+    def _build_turn_capsule(
+        self,
+        session: Session,
+        turn_state: dict[str, Any],
+        *,
+        capsule_id: str,
+        artifact_refs: list[str],
+        final_content: str,
+        source_revision: int,
+    ) -> dict[str, Any]:
+        user_goal = self._resolve_ref_content_text(session.key, turn_state.get("user_message_ref")).strip()
+        if not user_goal:
+            user_goal = "Continue the current task."
+        return {
+            "capsule_id": capsule_id,
+            "turn_id": turn_state["turn_id"],
+            "session_key": session.key,
+            "source_revision": source_revision,
+            "user_goal": user_goal,
+            "assistant_intent": truncate_text_fn(final_content or user_goal, 400),
+            "decisions": [],
+            "outcomes": [truncate_text_fn(final_content, 800)] if final_content else [],
+            "open_questions": [],
+            "artifact_refs": list(artifact_refs),
+            "next_expected_action": None,
+            "capsule_version": 1,
+            "created_at": state_timestamp(),
+        }
+
+    def _build_working_set_snapshot(
+        self,
+        session: Session,
+        turn_state: dict[str, Any],
+        *,
+        version: int,
+        capsule_ref: str | None,
+        artifact_refs: list[str],
+        source_revision: int,
+    ) -> dict[str, Any]:
+        user_goal = self._resolve_ref_content_text(session.key, turn_state.get("user_message_ref")).strip()
+        return {
+            "session_key": session.key,
+            "version": version,
+            "source_turn_id": turn_state["turn_id"],
+            "source_revision": source_revision,
+            "is_stable": True,
+            "published_by": "agent_loop",
+            "active_task": None,
+            "task_stage": None,
+            "active_goals": [user_goal] if user_goal else [],
+            "open_loops": [],
+            "last_user_focus": user_goal or None,
+            "relevant_capsule_refs": [capsule_ref] if capsule_ref else [],
+            "relevant_artifact_refs": list(artifact_refs),
+            "budget_hints": {},
+            "source_turn_ids": [turn_state["turn_id"]],
+            "created_at": state_timestamp(),
+        }
+
+    def _build_commit_manifest(
+        self,
+        session: Session,
+        turn_state: dict[str, Any],
+        *,
+        commit_id: str,
+        turn_revision: int,
+        artifact_refs: list[str],
+        capsule_ref: str | None,
+        working_set_version: int | None,
+        final_response_ref: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "commit_id": commit_id,
+            "turn_id": turn_state["turn_id"],
+            "session_key": session.key,
+            "turn_revision": turn_revision,
+            "artifact_refs": list(artifact_refs),
+            "capsule_ref": capsule_ref,
+            "working_set_version": working_set_version,
+            "final_response_ref": final_response_ref,
+            "completed_marker": True,
+            "created_at": state_timestamp(),
+        }
+
+    def _commit_validation_errors(self, session_key: str, turn_state: dict[str, Any]) -> list[str]:
+        errors: list[str] = []
+        commit_ref = turn_state.get("commit_manifest_ref")
+        if not isinstance(commit_ref, str) or not commit_ref:
+            errors.append("missing_commit_manifest_ref")
+            return errors
+        if turn_state.get("commit_state") != COMMIT_STATE_COMMITTED:
+            errors.append("commit_state_not_committed")
+        manifest = self.sessions.resolve_ref(session_key, commit_ref)
+        if not isinstance(manifest, dict):
+            errors.append("missing_commit_manifest")
+            return errors
+        if manifest.get("turn_revision") != turn_state.get("revision"):
+            errors.append("turn_revision_mismatch")
+        final_response_ref = manifest.get("final_response_ref")
+        if isinstance(final_response_ref, str) and final_response_ref:
+            if self.sessions.resolve_ref(session_key, final_response_ref) is None:
+                errors.append("missing_final_response")
+        else:
+            errors.append("missing_final_response_ref")
+        capsule_ref = manifest.get("capsule_ref")
+        if isinstance(capsule_ref, str) and capsule_ref:
+            if self.sessions.resolve_ref(session_key, capsule_ref) is None:
+                errors.append("missing_capsule")
+        working_set_version = manifest.get("working_set_version")
+        if isinstance(working_set_version, int):
+            if self.sessions.load_working_set(session_key, working_set_version) is None:
+                errors.append("missing_working_set")
+        for artifact_ref in manifest.get("artifact_refs") or []:
+            if self.sessions.resolve_ref(session_key, artifact_ref) is None:
+                errors.append("missing_artifact")
+                break
+        return errors
+
+    def _register_turn_message(
+        self,
+        session: Session,
+        turn_state: dict[str, Any],
+        *,
+        role: str,
+        content: Any,
+        is_injection: bool,
+    ) -> dict[str, Any]:
+        message_ref = self._save_message_object(
+            session_key=session.key,
+            turn_id=turn_state["turn_id"],
+            role=role,
+            content=content,
+        )
+        if not is_injection and not turn_state.get("user_message_ref"):
+            return self._advance_turn_state(
+                turn_state,
+                user_message_ref=message_ref,
+                current_stage=TURN_STAGE_AWAITING_MODEL,
+            )
+
+        injected = list(turn_state.get("injected_messages") or [])
+        injection_revision = int(turn_state.get("injection_revision", 0)) + 1
+        injected.append(
+            {
+                "message_ref": message_ref,
+                "role": role,
+                "content": content,
+                "injection_revision": injection_revision,
+                "created_at": state_timestamp(),
+            }
+        )
+        return self._advance_turn_state(
+            turn_state,
+            injected_messages=injected,
+            injection_revision=injection_revision,
+            current_stage=TURN_STAGE_AWAITING_MODEL,
+        )
+
+    def _checkpoint_stage(self, payload: dict[str, Any]) -> str:
+        phase = payload.get("phase")
+        pending_tool_calls = payload.get("pending_tool_calls") or []
+        if phase == "awaiting_tools" or pending_tool_calls:
+            return TURN_STAGE_AWAITING_TOOLS
+        if phase == "tools_completed":
+            return TURN_STAGE_AWAITING_MODEL
+        if phase == "final_response":
+            return TURN_STAGE_FINALIZING
+        return TURN_STAGE_AWAITING_MODEL
+
+    def _sync_turn_state_from_checkpoint(
+        self,
+        session: Session,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        turn_state = self.load_active_turn_state(session.key)
+        if not isinstance(turn_state, dict):
+            return None
+        assistant_message = payload.get("assistant_message")
+        error_state = dict(turn_state.get("error_state") or {})
+        if isinstance(assistant_message, dict):
+            error_state["checkpoint_assistant_message"] = assistant_message
+        if phase := payload.get("phase"):
+            error_state["checkpoint_phase"] = phase
+        merged_declared = self._merge_records_by_key(
+            list(turn_state.get("declared_tool_calls") or []),
+            list(payload.get("pending_tool_calls") or []),
+            key="id",
+        )
+        merged_completed = self._merge_records_by_key(
+            list(turn_state.get("completed_tool_results") or []),
+            list(payload.get("completed_tool_results") or []),
+            key="tool_call_id",
+        )
+        merged_artifact_refs = self._merge_refs(
+            list(turn_state.get("artifact_refs") or []),
+            self._artifact_refs_from_results(list(payload.get("completed_tool_results") or [])),
+        )
+        return self._advance_turn_state(
+            turn_state,
+            current_stage=self._checkpoint_stage(payload),
+            declared_tool_calls=merged_declared,
+            completed_tool_results=merged_completed,
+            artifact_refs=merged_artifact_refs,
+            error_state=error_state or None,
+        )
+
+    @staticmethod
+    def _pending_tool_calls_from_turn_state(turn_state: dict[str, Any]) -> list[dict[str, Any]]:
+        completed_ids = {
+            result.get("tool_call_id")
+            for result in (turn_state.get("completed_tool_results") or [])
+            if isinstance(result, dict) and result.get("tool_call_id")
+        }
+        pending: list[dict[str, Any]] = []
+        for tool_call in turn_state.get("declared_tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_id = tool_call.get("id")
+            if tool_id and tool_id not in completed_ids:
+                pending.append(tool_call)
+        return pending
+
+    def _materialize_turn_state_messages(self, turn_state: dict[str, Any]) -> list[dict[str, Any]]:
+        restored_messages: list[dict[str, Any]] = []
+        error_state = turn_state.get("error_state") or {}
+        assistant_message = error_state.get("checkpoint_assistant_message")
+        if isinstance(assistant_message, dict):
+            restored = dict(assistant_message)
+            restored.setdefault("timestamp", state_timestamp())
+            restored_messages.append(restored)
+        for message in turn_state.get("completed_tool_results") or []:
+            if isinstance(message, dict):
+                restored = dict(message)
+                restored.setdefault("timestamp", state_timestamp())
+                restored_messages.append(restored)
+        for tool_call in self._pending_tool_calls_from_turn_state(turn_state):
+            tool_id = tool_call.get("id")
+            name = ((tool_call.get("function") or {}).get("name")) or "tool"
+            restored_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": name,
+                    "content": "Error: Task interrupted before this tool finished.",
+                    "timestamp": state_timestamp(),
+                }
+            )
+        session_last_is_user = turn_state.get("user_message_ref")
+        if (
+            not restored_messages
+            and turn_state.get("current_stage") == TURN_STAGE_INTERRUPTED
+            and session_last_is_user
+        ):
+            restored_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Error: Task interrupted before a response was generated.",
+                    "timestamp": state_timestamp(),
+                    "_source_user_message_ref": session_last_is_user,
+                }
+            )
+        return restored_messages
+
+    def _append_projected_messages(self, session: Session, restored_messages: list[dict[str, Any]]) -> bool:
+        if not restored_messages:
+            return False
+        overlap = 0
+        max_overlap = min(len(session.messages), len(restored_messages))
+        for size in range(max_overlap, 0, -1):
+            existing = session.messages[-size:]
+            restored = restored_messages[:size]
+            if all(
+                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
+                for left, right in zip(existing, restored)
+            ):
+                overlap = size
+                break
+        session.messages.extend(restored_messages[overlap:])
+        return len(restored_messages[overlap:]) > 0
+
+    def _restore_turn_state(self, session: Session) -> bool:
+        turn_state = self.load_active_turn_state(session.key)
+        if not isinstance(turn_state, dict):
+            return False
+        if turn_state.get("current_stage") == TURN_STAGE_COMPLETED or turn_state.get("commit_manifest_ref"):
+            validation_errors = self._commit_validation_errors(session.key, turn_state)
+            if validation_errors:
+                turn_state = self.repair_partial_commit(session, turn_state) or turn_state
+            if (
+                isinstance(turn_state, dict)
+                and turn_state.get("current_stage") == TURN_STAGE_COMPLETED
+                and not self._commit_validation_errors(session.key, turn_state)
+            ):
+                self.sessions.publish_active_turn(session.key, None)
+                self.sessions.publish_latest_turn(session.key, turn_state["turn_id"])
+                return False
+        restored = self._materialize_turn_state_messages(turn_state)
+        return self._append_projected_messages(session, restored)
+
+    def finalize_turn(
+        self,
+        session: Session,
+        turn_state: dict[str, Any] | None,
+        *,
+        final_content: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(turn_state, dict):
+            return None
+        final_text = (final_content or "").strip()
+        if not final_text:
+            for message in reversed(session.messages):
+                if message.get("role") == "assistant" and not message.get("tool_calls"):
+                    final_text = self._content_to_text(message.get("content")).strip()
+                    if final_text:
+                        break
+        if not final_text:
+            final_text = EMPTY_FINAL_RESPONSE_MESSAGE
+
+        artifact_refs = self._merge_refs(
+            list(turn_state.get("artifact_refs") or []),
+            self._artifact_refs_from_results(list(turn_state.get("completed_tool_results") or [])),
+        )
+        current_revision = int(turn_state.get("revision", 0))
+        final_revision = current_revision + 1
+
+        capsule_id = self._new_object_id("capsule")
+        capsule = self._build_turn_capsule(
+            session,
+            turn_state,
+            capsule_id=capsule_id,
+            artifact_refs=artifact_refs,
+            final_content=final_text,
+            source_revision=final_revision,
+        )
+        self.sessions.save_capsule(session.key, capsule_id, capsule)
+        capsule_ref = make_ref(REF_CAPSULE, capsule_id)
+
+        previous_working_set_version = self._latest_working_set_version(session.key)
+        working_set_version = (previous_working_set_version or 0) + 1
+        working_set = self._build_working_set_snapshot(
+            session,
+            turn_state,
+            version=working_set_version,
+            capsule_ref=capsule_ref,
+            artifact_refs=artifact_refs,
+            source_revision=final_revision,
+        )
+        self.sessions.save_working_set(session.key, working_set)
+
+        response_id = self._new_object_id("resp")
+        response = {
+            "response_id": response_id,
+            "session_key": session.key,
+            "turn_id": turn_state["turn_id"],
+            "source_revision": final_revision,
+            "content": final_text,
+            "created_at": state_timestamp(),
+        }
+        self.sessions.save_response_object(session.key, response_id, response)
+        final_response_ref = make_ref(REF_RESPONSE, response_id)
+
+        commit_id = turn_state.get("commit_id") or self._new_object_id("commit")
+        manifest = self._build_commit_manifest(
+            session,
+            turn_state,
+            commit_id=commit_id,
+            turn_revision=final_revision,
+            artifact_refs=artifact_refs,
+            capsule_ref=capsule_ref,
+            working_set_version=working_set_version,
+            final_response_ref=final_response_ref,
+        )
+        self.sessions.save_commit_manifest(session.key, commit_id, manifest)
+        commit_ref = make_ref(REF_COMMIT, commit_id)
+
+        finalized = self._advance_turn_state(
+            turn_state,
+            expected_revision=current_revision,
+            commit_id=commit_id,
+            commit_manifest_ref=commit_ref,
+            final_response_ref=final_response_ref,
+            working_set_version=working_set_version,
+            capsule_ref=capsule_ref,
+            artifact_refs=artifact_refs,
+            commit_state=COMMIT_STATE_COMMITTED,
+            current_stage=TURN_STAGE_COMPLETED,
+            publish_active=True,
+            publish_latest=False,
+        )
+        self.sessions.publish_latest_turn(session.key, finalized["turn_id"])
+        if working_set.get("is_stable") is True:
+            self.sessions.publish_latest_working_set(
+                session.key,
+                working_set_version,
+                expected_version=previous_working_set_version,
+            )
+        return finalized
+
+    def repair_partial_commit(
+        self,
+        session: Session,
+        turn_state: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(turn_state, dict):
+            return None
+        repairing = self._advance_turn_state(
+            turn_state,
+            current_stage=TURN_STAGE_FINALIZING,
+            commit_state=COMMIT_STATE_REPAIR_NEEDED,
+            publish_active=True,
+            publish_latest=False,
+        )
+        artifact_refs = self._merge_refs(
+            list(repairing.get("artifact_refs") or []),
+            self._artifact_refs_from_results(list(repairing.get("completed_tool_results") or [])),
+        )
+        if not artifact_refs:
+            return self._advance_turn_state(
+                repairing,
+                current_stage=TURN_STAGE_INTERRUPTED,
+                commit_state=COMMIT_STATE_REPAIR_NEEDED,
+                final_response_ref=None,
+                capsule_ref=None,
+                working_set_version=None,
+                commit_id=None,
+                commit_manifest_ref=None,
+                publish_active=True,
+                publish_latest=False,
+            )
+
+        missing_artifact = any(
+            self.sessions.resolve_ref(session.key, artifact_ref) is None
+            for artifact_ref in artifact_refs
+        )
+        capsule_ref = repairing.get("capsule_ref")
+        final_response_ref = repairing.get("final_response_ref")
+        working_set_version = repairing.get("working_set_version")
+        repairable = (
+            isinstance(capsule_ref, str)
+            and self.sessions.resolve_ref(session.key, capsule_ref) is not None
+            and isinstance(final_response_ref, str)
+            and self.sessions.resolve_ref(session.key, final_response_ref) is not None
+            and isinstance(working_set_version, int)
+            and self.sessions.load_working_set(session.key, working_set_version) is not None
+            and not missing_artifact
+        )
+        if not repairable:
+            return self._advance_turn_state(
+                repairing,
+                current_stage=TURN_STAGE_INTERRUPTED,
+                commit_state=COMMIT_STATE_REPAIR_NEEDED,
+                final_response_ref=None,
+                capsule_ref=None,
+                working_set_version=None,
+                commit_id=None,
+                commit_manifest_ref=None,
+                publish_active=True,
+                publish_latest=False,
+            )
+
+        commit_id = repairing.get("commit_id") or self._new_object_id("commit")
+        manifest = self._build_commit_manifest(
+            session,
+            repairing,
+            commit_id=commit_id,
+            turn_revision=int(repairing.get("revision", 0)) + 1,
+            artifact_refs=artifact_refs,
+            capsule_ref=capsule_ref,
+            working_set_version=working_set_version,
+            final_response_ref=final_response_ref,
+        )
+        self.sessions.save_commit_manifest(session.key, commit_id, manifest)
+        repaired = self._advance_turn_state(
+            repairing,
+            commit_id=commit_id,
+            commit_manifest_ref=make_ref(REF_COMMIT, commit_id),
+            artifact_refs=artifact_refs,
+            commit_state=COMMIT_STATE_COMMITTED,
+            current_stage=TURN_STAGE_COMPLETED,
+            publish_active=True,
+            publish_latest=False,
+        )
+        self.sessions.publish_latest_turn(session.key, repaired["turn_id"])
+        if isinstance(working_set_version, int):
+            latest_version = self._latest_working_set_version(session.key)
+            if latest_version is None or working_set_version > latest_version:
+                self.sessions.publish_latest_working_set(
+                    session.key,
+                    working_set_version,
+                    expected_version=latest_version,
+                )
+        return repaired
+
+    def _interrupt_turn(
+        self,
+        session: Session,
+        *,
+        default_resume: str | None = None,
+    ) -> dict[str, Any] | None:
+        turn_state = self.load_active_turn_state(session.key)
+        if not isinstance(turn_state, dict):
+            return None
+        interrupted = self._advance_turn_state(
+            turn_state,
+            current_stage=TURN_STAGE_INTERRUPTED,
+        )
+        if default_resume is not None and interrupted.get("resume_action") is None:
+            interrupted = self._advance_turn_state(
+                interrupted,
+                resume_action=default_resume,
+            )
+        return interrupted
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -375,7 +1122,7 @@ class AgentLoop:
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
                 return
-            self._set_runtime_checkpoint(session, payload)
+            self._sync_turn_state_from_checkpoint(session, payload)
 
         async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
             """Non-blocking drain of follow-up messages from the pending queue."""
@@ -402,8 +1149,31 @@ class AgentLoop:
                     merged: str | list[dict[str, Any]] = f"{runtime_ctx}\n\n{user_content}"
                 else:
                     merged = [{"type": "text", "text": runtime_ctx}] + user_content
+                if session is not None and isinstance(content, str) and content.strip():
+                    active_turn = self.load_active_turn_state(session.key)
+                    if isinstance(active_turn, dict):
+                        session.add_message("user", content)
+                        self.sessions.save(session)
+                        self._register_turn_message(
+                            session,
+                            active_turn,
+                            role="user",
+                            content=self._build_message_object_content(content, media),
+                            is_injection=True,
+                        )
                 items.append({"role": "user", "content": merged})
             return items
+
+        active_turn = self.load_active_turn_state(session.key) if session else None
+
+        def _active_revision() -> int | None:
+            if session is None:
+                return None
+            current = self.load_active_turn_state(session.key)
+            if not isinstance(current, dict):
+                return None
+            revision = current.get("injection_revision")
+            return revision if isinstance(revision, int) else None
 
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
@@ -422,6 +1192,13 @@ class AgentLoop:
             progress_callback=on_progress,
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
+            turn_id=active_turn.get("turn_id") if isinstance(active_turn, dict) else None,
+            active_revision=(
+                active_turn.get("injection_revision")
+                if isinstance(active_turn, dict) and isinstance(active_turn.get("injection_revision"), int)
+                else None
+            ),
+            revision_provider=_active_revision if session else None,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -626,22 +1403,25 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            if self._restore_runtime_checkpoint(session):
-                self.sessions.save(session)
-            if self._restore_pending_user_turn(session):
+            if self._restore_turn_state(session):
                 self.sessions.save(session)
 
-            session, pending = self.auto_compact.prepare_session(session, key)
+            session = self.auto_compact.prepare_session(session, key)
 
             await self.consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
 
+            working_set = self.sessions.load_latest_working_set(session.key)
             messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-                session_summary=pending,
+                working_set=working_set,
+                recent_raw_turns=history,
+                selected_capsules=[],
+                selected_artifacts=[],
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
                 current_role=current_role,
             )
             final_content, _, all_msgs, _, _ = await self._run_agent_loop(
@@ -649,7 +1429,7 @@ class AgentLoop:
                 message_id=msg.metadata.get("message_id"),
             )
             self._save_turn(session, all_msgs, 1 + len(history))
-            self._clear_runtime_checkpoint(session)
+            self.finalize_turn(session, self.load_active_turn_state(session.key), final_content=final_content)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(
@@ -669,12 +1449,10 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
-        if self._restore_runtime_checkpoint(session):
-            self.sessions.save(session)
-        if self._restore_pending_user_turn(session):
+        if self._restore_turn_state(session):
             self.sessions.save(session)
 
-        session, pending = self.auto_compact.prepare_session(session, key)
+        session = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
@@ -691,10 +1469,13 @@ class AgentLoop:
 
         history = session.get_history(max_messages=0)
 
+        working_set = self.sessions.load_latest_working_set(session.key)
         initial_messages = self.context.build_messages(
-            history=history,
+            working_set=working_set,
+            recent_raw_turns=history,
+            selected_capsules=[],
+            selected_artifacts=[],
             current_message=msg.content,
-            session_summary=pending,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -713,30 +1494,44 @@ class AgentLoop:
                 )
             )
 
-        # Persist the triggering user message immediately, before running the
-        # agent loop. If the process is killed mid-turn (OOM, SIGKILL, self-
-        # restart, etc.), the existing runtime_checkpoint preserves the
-        # in-flight assistant/tool state but NOT the user message itself, so
-        # the user's prompt is silently lost on recovery. Saving it up front
-        # makes recovery possible from the session log alone.
+        # Persist the triggering user message immediately so TurnState retains
+        # the active turn's user anchor even if the process dies mid-turn.
         user_persisted_early = False
+        active_turn = self.load_active_turn_state(session.key)
+        if not isinstance(active_turn, dict):
+            active_turn = self.create_turn_state(session.key)
         if isinstance(msg.content, str) and msg.content.strip():
             session.add_message("user", msg.content)
-            self._mark_pending_user_turn(session)
             self.sessions.save(session)
+            active_turn = self._register_turn_message(
+                session,
+                active_turn,
+                role="user",
+                content=self._build_message_object_content(msg.content, msg.media if msg.media else None),
+                is_injection=bool(active_turn.get("user_message_ref")),
+            )
             user_persisted_early = True
 
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            session=session,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-            pending_queue=pending_queue,
-        )
+        try:
+            final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                session=session,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+                pending_queue=pending_queue,
+            )
+        except asyncio.CancelledError:
+            self._interrupt_turn(session)
+            self.sessions.save(session)
+            raise
+        except Exception:
+            self._interrupt_turn(session)
+            self.sessions.save(session)
+            raise
 
         if final_content is None or not final_content.strip():
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -744,8 +1539,11 @@ class AgentLoop:
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
         self._save_turn(session, all_msgs, save_skip)
-        self._clear_pending_user_turn(session)
-        self._clear_runtime_checkpoint(session)
+        self.finalize_turn(
+            session,
+            self.load_active_turn_state(session.key),
+            final_content=final_content,
+        )
         self.sessions.save(session)
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
 
@@ -857,21 +1655,6 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
-        """Persist the latest in-flight turn state into session metadata."""
-        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
-        self.sessions.save(session)
-
-    def _mark_pending_user_turn(self, session: Session) -> None:
-        session.metadata[self._PENDING_USER_TURN_KEY] = True
-
-    def _clear_pending_user_turn(self, session: Session) -> None:
-        session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
-
-    def _clear_runtime_checkpoint(self, session: Session) -> None:
-        if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
-            session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
-
     @staticmethod
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
         return (
@@ -883,80 +1666,6 @@ class AgentLoop:
             message.get("reasoning_content"),
             message.get("thinking_blocks"),
         )
-
-    def _restore_runtime_checkpoint(self, session: Session) -> bool:
-        """Materialize an unfinished turn into session history before a new request."""
-        from datetime import datetime
-
-        checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
-        if not isinstance(checkpoint, dict):
-            return False
-
-        assistant_message = checkpoint.get("assistant_message")
-        completed_tool_results = checkpoint.get("completed_tool_results") or []
-        pending_tool_calls = checkpoint.get("pending_tool_calls") or []
-
-        restored_messages: list[dict[str, Any]] = []
-        if isinstance(assistant_message, dict):
-            restored = dict(assistant_message)
-            restored.setdefault("timestamp", datetime.now().isoformat())
-            restored_messages.append(restored)
-        for message in completed_tool_results:
-            if isinstance(message, dict):
-                restored = dict(message)
-                restored.setdefault("timestamp", datetime.now().isoformat())
-                restored_messages.append(restored)
-        for tool_call in pending_tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_id = tool_call.get("id")
-            name = ((tool_call.get("function") or {}).get("name")) or "tool"
-            restored_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": name,
-                    "content": "Error: Task interrupted before this tool finished.",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-
-        overlap = 0
-        max_overlap = min(len(session.messages), len(restored_messages))
-        for size in range(max_overlap, 0, -1):
-            existing = session.messages[-size:]
-            restored = restored_messages[:size]
-            if all(
-                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
-                for left, right in zip(existing, restored)
-            ):
-                overlap = size
-                break
-        session.messages.extend(restored_messages[overlap:])
-
-        self._clear_pending_user_turn(session)
-        self._clear_runtime_checkpoint(session)
-        return True
-
-    def _restore_pending_user_turn(self, session: Session) -> bool:
-        """Close a turn that only persisted the user message before crashing."""
-        from datetime import datetime
-
-        if not session.metadata.get(self._PENDING_USER_TURN_KEY):
-            return False
-
-        if session.messages and session.messages[-1].get("role") == "user":
-            session.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Error: Task interrupted before a response was generated.",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-            session.updated_at = datetime.now()
-
-        self._clear_pending_user_turn(session)
-        return True
 
     async def process_direct(
         self,

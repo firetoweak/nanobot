@@ -67,7 +67,10 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     builder = ContextBuilder(workspace)
 
     messages = builder.build_messages(
-        history=[],
+        working_set=None,
+        recent_raw_turns=[],
+        selected_capsules=[],
+        selected_artifacts=[],
         current_message="Return exactly: OK",
         channel="cli",
         chat_id="direct",
@@ -85,6 +88,46 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_build_messages_can_use_working_set_without_history_primary_input(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    working_set = {
+        "session_key": "cli:direct",
+        "version": 3,
+        "source_turn_id": "turn-3",
+        "source_revision": 4,
+        "is_stable": True,
+        "published_by": "agent_loop",
+        "active_task": "Refactor prompt assembly",
+        "task_stage": "phase-2",
+        "active_goals": ["Switch ContextBuilder to structured input"],
+        "open_loops": ["Preserve multimodal handling"],
+        "last_user_focus": "Structured prompt cutover",
+        "relevant_capsule_refs": [],
+        "relevant_artifact_refs": [],
+        "budget_hints": {"raw_turn_budget": 2},
+        "source_turn_ids": ["turn-2", "turn-3"],
+        "created_at": "2026-04-01T10:00:00",
+    }
+
+    messages = builder.build_messages(
+        working_set=working_set,
+        recent_raw_turns=[],
+        selected_capsules=[],
+        selected_artifacts=[],
+        current_message="继续执行阶段 2",
+        channel="cli",
+        chat_id="direct",
+    )
+
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert "[Working Set Snapshot]" in messages[1]["content"]
+    assert "Refactor prompt assembly" in messages[1]["content"]
+    assert "phase-2" in messages[1]["content"]
+    assert "Structured prompt cutover" in messages[1]["content"]
 
 
 def test_archive_history_is_not_injected_into_system_prompt(tmp_path) -> None:
@@ -169,7 +212,11 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     builder = ContextBuilder(workspace)
 
     messages = builder.build_messages(
-        history=[], current_message="hi",
+        working_set=None,
+        recent_raw_turns=[],
+        selected_capsules=[],
+        selected_artifacts=[],
+        current_message="hi",
         channel="telegram", chat_id="123",
     )
     system = messages[0]["content"]
@@ -182,7 +229,10 @@ def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path
     builder = ContextBuilder(workspace)
 
     messages = builder.build_messages(
-        history=[{"role": "assistant", "content": "previous result"}],
+        working_set=None,
+        recent_raw_turns=[{"role": "assistant", "content": "previous result"}],
+        selected_capsules=[],
+        selected_artifacts=[],
         current_message="subagent result",
         channel="cli",
         chat_id="direct",
@@ -191,6 +241,31 @@ def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path
 
     for left, right in zip(messages, messages[1:]):
         assert not (left.get("role") == right.get("role") == "assistant")
+
+
+def test_multimodal_user_message_still_merges_runtime_context(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    png = workspace / "chart.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+
+    messages = builder.build_messages(
+        working_set=None,
+        recent_raw_turns=[],
+        selected_capsules=[],
+        selected_artifacts=[],
+        current_message="请描述这张图",
+        media=[str(png)],
+        channel="cli",
+        chat_id="direct",
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, list)
+    assert user_content[0]["type"] == "text"
+    assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content[0]["text"]
+    assert any(block.get("type") == "image_url" for block in user_content[1:])
+    assert any(block.get("type") == "text" and "请描述这张图" in block.get("text", "") for block in user_content[1:])
 
 
 def test_always_skills_excluded_from_skills_index(tmp_path) -> None:

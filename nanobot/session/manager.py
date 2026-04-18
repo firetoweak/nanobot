@@ -10,6 +10,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.session.state_store import StateStore
 from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
 
 
@@ -104,6 +105,7 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
+        self.state_store = StateStore(workspace)
         self._cache: dict[str, Session] = {}
 
     def _get_session_path(self, key: str) -> Path:
@@ -237,3 +239,120 @@ class SessionManager:
                 continue
 
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def load_turn_state(self, session_key: str, turn_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_turn_state(session_key, turn_id)
+
+    def save_turn_state(
+        self,
+        session_key: str,
+        turn_id: str,
+        data: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+    ) -> None:
+        self.state_store.save_turn_state(
+            session_key,
+            turn_id,
+            data,
+            expected_revision=expected_revision,
+        )
+
+    def save_message_object(self, session_key: str, message_id: str, data: dict[str, Any]) -> None:
+        self.state_store.save_message_object(session_key, message_id, data)
+
+    def load_message_object(self, session_key: str, message_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_message_object(session_key, message_id)
+
+    def save_response_object(self, session_key: str, response_id: str, data: dict[str, Any]) -> None:
+        self.state_store.save_response_object(session_key, response_id, data)
+
+    def load_response_object(self, session_key: str, response_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_response_object(session_key, response_id)
+
+    def save_working_set(self, session_key: str, snapshot: dict[str, Any]) -> None:
+        self.state_store.save_working_set(session_key, snapshot)
+
+    def load_working_set(self, session_key: str, version: int) -> dict[str, Any] | None:
+        return self.state_store.load_working_set(session_key, version)
+
+    def load_latest_working_set(self, session_key: str) -> dict[str, Any] | None:
+        return self.state_store.load_latest_working_set(session_key)
+
+    def publish_latest_working_set(
+        self,
+        session_key: str,
+        version: int,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        self.state_store.publish_latest_working_set(
+            session_key,
+            version,
+            expected_version=expected_version,
+        )
+
+    def save_capsule(self, session_key: str, capsule_id: str, data: dict[str, Any]) -> None:
+        self.state_store.save_capsule(session_key, capsule_id, data)
+
+    def load_capsule(self, session_key: str, capsule_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_capsule(session_key, capsule_id)
+
+    def save_artifact(self, session_key: str, artifact_id: str, data: dict[str, Any]) -> None:
+        self.state_store.save_artifact(session_key, artifact_id, data)
+
+    def load_artifact(self, session_key: str, artifact_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_artifact(session_key, artifact_id)
+
+    def save_commit_manifest(self, session_key: str, commit_id: str, data: dict[str, Any]) -> None:
+        self.state_store.save_commit_manifest(session_key, commit_id, data)
+
+    def load_commit_manifest(self, session_key: str, commit_id: str) -> dict[str, Any] | None:
+        return self.state_store.load_commit_manifest(session_key, commit_id)
+
+    def read_state_index(self, session_key: str, name: str) -> dict[str, Any] | None:
+        return self.state_store.read_index(session_key, name)
+
+    def write_state_index(self, session_key: str, name: str, data: dict[str, Any]) -> None:
+        self.state_store.write_index(session_key, name, data)
+
+    def resolve_ref(self, session_key: str, ref: str) -> dict[str, Any] | None:
+        return self.state_store.resolve_ref(session_key, ref)
+
+    def publish_active_turn(self, session_key: str, turn_id: str | None) -> None:
+        if turn_id is None:
+            self.write_state_index(session_key, "active-turn", {"turn_id": None})
+            return
+        self.write_state_index(session_key, "active-turn", {"turn_id": turn_id})
+
+    def get_active_turn_id(self, session_key: str) -> str | None:
+        index = self.read_state_index(session_key, "active-turn")
+        if not isinstance(index, dict):
+            return None
+        turn_id = index.get("turn_id")
+        return turn_id if isinstance(turn_id, str) and turn_id else None
+
+    def load_active_turn_state(self, session_key: str) -> dict[str, Any] | None:
+        turn_id = self.get_active_turn_id(session_key)
+        if not turn_id:
+            return None
+        return self.load_turn_state(session_key, turn_id)
+
+    def publish_latest_turn(self, session_key: str, turn_id: str | None) -> None:
+        if turn_id is None:
+            self.write_state_index(session_key, "latest-turn", {"turn_id": None})
+            return
+        self.write_state_index(session_key, "latest-turn", {"turn_id": turn_id})
+
+    def get_latest_turn_id(self, session_key: str) -> str | None:
+        index = self.read_state_index(session_key, "latest-turn")
+        if not isinstance(index, dict):
+            return None
+        turn_id = index.get("turn_id")
+        return turn_id if isinstance(turn_id, str) and turn_id else None
+
+    def load_latest_turn_state(self, session_key: str) -> dict[str, Any] | None:
+        turn_id = self.get_latest_turn_id(session_key)
+        if not turn_id:
+            return None
+        return self.load_turn_state(session_key, turn_id)

@@ -17,6 +17,7 @@ from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_
 
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.session.state import is_completed_manifest
 from nanobot.utils.gitstore import GitStore
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ class MemoryStore:
         self.working_dir = ensure_dir(workspace / "working")
         self.archive_dir = ensure_dir(workspace / "archive")
         self.candidate_dir = ensure_dir(workspace / "candidate")
+        self.state_dir = ensure_dir(workspace / ".nanobot" / "state")
 
         self.soul_file = self.identity_dir / "SOUL.md"
         self.user_rules_file = self.identity_dir / "USER_RULES.md"
@@ -97,10 +99,20 @@ class MemoryStore:
         self.user_profile_file.write_text(content, encoding="utf-8")
 
     def read_current(self) -> str:
+        """Read the legacy working mirror view."""
         return self.read_file(self.current_file)
 
     def write_current(self, content: str) -> None:
+        """Write the legacy working mirror view."""
         self.current_file.write_text(content, encoding="utf-8")
+
+    def read_current_mirror(self) -> str:
+        """Explicit mirror alias for `working/CURRENT.md`."""
+        return self.read_current()
+
+    def write_current_mirror(self, content: str) -> None:
+        """Explicit mirror alias for `working/CURRENT.md`."""
+        self.write_current(content)
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -293,6 +305,22 @@ class MemoryStore:
                 return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
             except (ValueError, OSError):
                 pass
+        sessions_root = self.state_dir / "sessions"
+        total = 0
+        if sessions_root.exists():
+            for session_dir in sessions_root.iterdir():
+                cursor_file = session_dir / "indexes" / "dream-cursor.json"
+                if not cursor_file.exists():
+                    continue
+                try:
+                    data = json.loads(cursor_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                processed_keys = data.get("processed_keys") or []
+                if isinstance(processed_keys, list):
+                    total += len([key for key in processed_keys if isinstance(key, str) and key])
+        if total:
+            return total
         return 0
 
     def set_last_dream_cursor(self, cursor: int) -> None:
@@ -404,10 +432,14 @@ class Consolidator:
 
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
-        history = session.get_history(max_messages=0)
+        recent_raw_turns = session.get_history(max_messages=0)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        working_set = self.sessions.load_latest_working_set(session.key)
         probe_messages = self._build_messages(
-            history=history,
+            working_set=working_set,
+            recent_raw_turns=recent_raw_turns,
+            selected_capsules=[],
+            selected_artifacts=[],
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
@@ -539,12 +571,7 @@ class Consolidator:
 
 
 class Dream:
-    """Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
-
-    Phase 1 produces an analysis summary (plain LLM call).
-    Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
-    LLM can make targeted, incremental edits instead of replacing entire files.
-    """
+    """Process committed turns into longer-term memory updates."""
 
     def __init__(
         self,
@@ -563,6 +590,9 @@ class Dream:
         self.max_tool_result_chars = max_tool_result_chars
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
+        from nanobot.session.manager import SessionManager
+
+        self._sessions = SessionManager(store.workspace)
 
     # -- tool registry -------------------------------------------------------
 
@@ -625,53 +655,261 @@ class Dream:
                 entries[d.name] = desc
         return [f"{name} — {desc}" for name, desc in sorted(entries.items())]
 
-    # -- main entry ----------------------------------------------------------
+    @staticmethod
+    def _make_idempotency_key(turn_id: str, capsule_id: str, manifest_revision: int) -> str:
+        return f"{turn_id}:{capsule_id}:{manifest_revision}"
 
-    async def run(self) -> bool:
-        """Process unprocessed history entries. Returns True if work was done."""
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+    def _load_dream_cursor_state(self, session_key: str) -> dict[str, Any]:
+        data = self._sessions.read_state_index(session_key, "dream-cursor")
+        return data if isinstance(data, dict) else {}
 
-        last_cursor = self.store.get_last_dream_cursor()
-        entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
-        if not entries:
-            return False
+    def _save_dream_cursor_state(self, session_key: str, data: dict[str, Any]) -> None:
+        self._sessions.write_state_index(session_key, "dream-cursor", data)
 
-        batch = entries[: self.max_batch_size]
-        logger.info(
-            "Dream: processing {} entries (cursor {}→{}), batch={}",
-            len(entries), last_cursor, batch[-1]["cursor"], len(batch),
-        )
+    def _iter_state_session_dirs(self) -> list[Path]:
+        root = self.store.state_dir / "sessions"
+        if not root.exists():
+            return []
+        return sorted(path for path in root.iterdir() if path.is_dir())
 
-        # Build history text for LLM
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {e['content']}" for e in batch
-        )
+    @staticmethod
+    def _safe_read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
-        # Current file contents
+    @staticmethod
+    def _dream_artifact_digest(artifact: dict[str, Any]) -> dict[str, Any]:
+        render = artifact.get("dream_render")
+        if isinstance(render, dict):
+            return dict(render)
+        safe_projection = {
+            "artifact_id": artifact.get("artifact_id"),
+            "source_type": artifact.get("source_type"),
+            "source_input": artifact.get("source_input"),
+            "digest": artifact.get("digest"),
+            "content_version": artifact.get("content_version"),
+            "invalidated_by": list(artifact.get("invalidated_by") or []),
+        }
+        return {key: value for key, value in safe_projection.items() if value not in (None, "", [])}
+
+    @staticmethod
+    def _candidate_signals(
+        capsule: dict[str, Any],
+        working_set_snapshot: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        signals: list[dict[str, Any]] = []
+        if user_goal := capsule.get("user_goal"):
+            signals.append({"type": "user_goal", "content": user_goal})
+        for decision in capsule.get("decisions") or []:
+            signals.append({"type": "decision", "content": decision})
+        for outcome in capsule.get("outcomes") or []:
+            signals.append({"type": "outcome", "content": outcome})
+        for question in capsule.get("open_questions") or []:
+            signals.append({"type": "open_question", "content": question})
+        if isinstance(working_set_snapshot, dict):
+            for goal in working_set_snapshot.get("active_goals") or []:
+                signals.append({"type": "active_goal", "content": goal})
+            for loop in working_set_snapshot.get("open_loops") or []:
+                signals.append({"type": "open_loop", "content": loop})
+            if focus := working_set_snapshot.get("last_user_focus"):
+                signals.append({"type": "last_user_focus", "content": focus})
+        return signals
+
+    def _iter_pending_dream_inputs(self) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for session_dir in self._iter_state_session_dirs():
+            turns_dir = session_dir / "turns"
+            if not turns_dir.exists():
+                continue
+            for turn_path in sorted(turns_dir.glob("*.json")):
+                turn_state = self._safe_read_json(turn_path)
+                if not isinstance(turn_state, dict):
+                    continue
+                session_key = turn_state.get("session_key")
+                turn_id = turn_state.get("turn_id")
+                if not isinstance(session_key, str) or not isinstance(turn_id, str):
+                    continue
+                if turn_state.get("commit_state") != "committed":
+                    continue
+                commit_ref = turn_state.get("commit_manifest_ref")
+                if not isinstance(commit_ref, str) or not commit_ref:
+                    continue
+                manifest = self._sessions.resolve_ref(session_key, commit_ref)
+                if not is_completed_manifest(manifest):
+                    continue
+                manifest_revision = manifest.get("turn_revision")
+                if manifest_revision != turn_state.get("revision"):
+                    continue
+                capsule_ref = manifest.get("capsule_ref")
+                if not isinstance(capsule_ref, str) or not capsule_ref:
+                    continue
+                capsule = self._sessions.resolve_ref(session_key, capsule_ref)
+                if not isinstance(capsule, dict):
+                    continue
+                capsule_id = capsule.get("capsule_id")
+                if not isinstance(capsule_id, str) or not capsule_id:
+                    continue
+                idempotency_key = self._make_idempotency_key(
+                    turn_id,
+                    capsule_id,
+                    int(manifest_revision),
+                )
+                cursor_state = self._load_dream_cursor_state(session_key)
+                processed_keys = {
+                    key
+                    for key in cursor_state.get("processed_keys") or []
+                    if isinstance(key, str) and key
+                }
+                if idempotency_key in processed_keys:
+                    continue
+                working_set_snapshot = None
+                working_set_version = manifest.get("working_set_version")
+                if isinstance(working_set_version, int):
+                    working_set_snapshot = self._sessions.load_working_set(session_key, working_set_version)
+                artifact_digests: list[dict[str, Any]] = []
+                for artifact_ref in manifest.get("artifact_refs") or []:
+                    artifact = self._sessions.resolve_ref(session_key, artifact_ref)
+                    if isinstance(artifact, dict):
+                        artifact_digests.append(self._dream_artifact_digest(artifact))
+                pending.append(
+                    {
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                        "capsule": dict(capsule),
+                        "working_set_snapshot": (
+                            dict(working_set_snapshot) if isinstance(working_set_snapshot, dict) else None
+                        ),
+                        "artifact_digests": artifact_digests,
+                        "candidate_signals": self._candidate_signals(capsule, working_set_snapshot),
+                        "idempotency_key": idempotency_key,
+                        "_sort_key": (
+                            str(manifest.get("created_at") or capsule.get("created_at") or ""),
+                            session_key,
+                            turn_id,
+                        ),
+                    }
+                )
+        pending.sort(key=lambda item: item["_sort_key"])
+        return pending
+
+    @staticmethod
+    def _format_dream_inputs(inputs: list[dict[str, Any]]) -> str:
+        blocks: list[str] = []
+        for idx, item in enumerate(inputs, start=1):
+            capsule = item["capsule"]
+            working_set = item.get("working_set_snapshot")
+            block_lines = [
+                f"## Dream Input {idx}",
+                f"- Session Key: {item['session_key']}",
+                f"- Turn ID: {item['turn_id']}",
+                f"- Idempotency Key: {item['idempotency_key']}",
+                f"- Capsule ID: {capsule.get('capsule_id')}",
+            ]
+            if isinstance(working_set, dict):
+                block_lines.append(f"- Working Set Version: {working_set.get('version')}")
+            block_lines.extend(
+                [
+                    "",
+                    "### Capsule",
+                    json.dumps(capsule, ensure_ascii=False, indent=2),
+                    "",
+                    "### Artifact Digests",
+                    json.dumps(item.get("artifact_digests") or [], ensure_ascii=False, indent=2),
+                    "",
+                    "### Candidate Signals",
+                    json.dumps(item.get("candidate_signals") or [], ensure_ascii=False, indent=2),
+                ]
+            )
+            if isinstance(working_set, dict):
+                block_lines.extend(
+                    [
+                        "",
+                        "### Working Set Snapshot",
+                        json.dumps(working_set, ensure_ascii=False, indent=2),
+                    ]
+                )
+            blocks.append("\n".join(block_lines))
+        return "\n\n".join(blocks)
+
+    def _build_file_context(self) -> str:
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_soul = self.store.read_soul() or "(empty)"
         current_user_rules = self.store.read_user_rules() or "(empty)"
         current_user_profile = self.store.read_user_profile() or "(empty)"
-        current_working = self.store.read_current() or "(empty)"
-        recent_archive = self.store.get_recent_history_context(max_entries=self.max_batch_size) or "(empty)"
         recent_reflections = self.store.get_recent_reflections_context(max_entries=10) or "(empty)"
         current_candidates = self.store.get_candidate_context(max_entries=10) or "(empty)"
-
-        file_context = (
+        return (
             f"## Current Date\n{current_date}\n\n"
             f"## Current identity/SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current identity/USER_RULES.md ({len(current_user_rules)} chars)\n{current_user_rules}\n\n"
             f"## Current identity/USER_PROFILE.md ({len(current_user_profile)} chars)\n{current_user_profile}\n\n"
-            f"## Current working/CURRENT.md ({len(current_working)} chars)\n{current_working}\n\n"
-            f"## Recent archive/history.jsonl\n{recent_archive}\n\n"
+            "## working/CURRENT.md Policy\n"
+            "Treat working/CURRENT.md as a mirror-only output. Do not use it as a source of truth.\n\n"
             f"## Recent archive/reflections.jsonl\n{recent_reflections}\n\n"
             f"## Recent candidate/observations.jsonl\n{current_candidates}"
         )
 
-        # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
+    def _mark_processed(self, inputs: list[dict[str, Any]]) -> None:
+        by_session: dict[str, list[dict[str, Any]]] = {}
+        for item in inputs:
+            by_session.setdefault(item["session_key"], []).append(item)
+        for session_key, entries in by_session.items():
+            cursor_state = self._load_dream_cursor_state(session_key)
+            processed_keys = [
+                key
+                for key in cursor_state.get("processed_keys") or []
+                if isinstance(key, str) and key
+            ]
+            for entry in entries:
+                processed_keys.append(entry["idempotency_key"])
+            deduped = list(dict.fromkeys(processed_keys))
+            last_entry = entries[-1]
+            self._save_dream_cursor_state(
+                session_key,
+                {
+                    "processed_keys": deduped,
+                    "processed_count": len(deduped),
+                    "last_turn_id": last_entry["turn_id"],
+                    "last_idempotency_key": last_entry["idempotency_key"],
+                    "updated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                },
+            )
+        self.store.set_last_dream_cursor(self._count_processed_keys())
+
+    def _count_processed_keys(self) -> int:
+        total = 0
+        for session_dir in self._iter_state_session_dirs():
+            cursor = self._safe_read_json(session_dir / "indexes" / "dream-cursor.json")
+            if not isinstance(cursor, dict):
+                continue
+            processed_keys = cursor.get("processed_keys") or []
+            if isinstance(processed_keys, list):
+                total += len([key for key in processed_keys if isinstance(key, str) and key])
+        return total
+
+    # -- main entry ----------------------------------------------------------
+
+    async def run(self) -> bool:
+        """Process committed turn capsules. Returns True if work was done."""
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+        pending_inputs = self._iter_pending_dream_inputs()
+        if not pending_inputs:
+            return False
+
+        batch = pending_inputs[: self.max_batch_size]
+        logger.info(
+            "Dream: processing {} committed turn(s), batch={}",
+            len(pending_inputs), len(batch),
         )
+
+        dream_inputs_text = self._format_dream_inputs(batch)
+        file_context = self._build_file_context()
+
+        phase1_prompt = f"## Structured Dream Inputs\n{dream_inputs_text}\n\n{file_context}"
 
         try:
             phase1_response = await self.provider.chat_with_retry(
@@ -700,7 +938,11 @@ class Dream:
                 "\n\n## Existing Skills\n"
                 + "\n".join(f"- {s}" for s in existing_skills)
             )
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
+        phase2_prompt = (
+            f"## Analysis Result\n{analysis}\n\n"
+            f"## Structured Dream Inputs\n{dream_inputs_text}\n\n"
+            f"{file_context}{skills_section}"
+        )
 
         tools = self._tools
         skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
@@ -742,26 +984,24 @@ class Dream:
                 if event["status"] == "ok":
                     changelog.append(f"{event['name']}: {event['detail']}")
 
-        # Advance cursor — always, to avoid re-processing Phase 1
-        new_cursor = batch[-1]["cursor"]
-        self.store.set_last_dream_cursor(new_cursor)
+        self._mark_processed(batch)
         self.store.compact_history()
 
         if result and result.stop_reason == "completed":
             logger.info(
-                "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
+                "Dream done: {} change(s), processed_turns={}",
+                len(changelog), len(batch),
             )
         else:
             reason = result.stop_reason if result else "exception"
             logger.warning(
-                "Dream incomplete ({}): cursor advanced to {}",
-                reason, new_cursor,
+                "Dream incomplete ({}): processed_turns={}",
+                reason, len(batch),
             )
 
         # Git auto-commit (only when there are actual changes)
         if changelog and self.store.git.is_initialized():
-            ts = batch[-1]["timestamp"]
+            ts = datetime.now().strftime("%Y-%m-%d")
             sha = self.store.git.auto_commit(f"dream: {ts}, {len(changelog)} change(s)")
             if sha:
                 logger.info("Dream commit: {}", sha)

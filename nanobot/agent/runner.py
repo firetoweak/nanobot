@@ -6,19 +6,17 @@ import asyncio
 from dataclasses import dataclass, field
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from loguru import logger
 
+from nanobot.agent.artifact_render import persist_tool_artifact
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import (
     build_assistant_message,
-    estimate_message_tokens,
-    estimate_prompt_tokens_chain,
-    find_legal_message_start,
     maybe_persist_tool_result,
     truncate_text,
 )
@@ -37,13 +35,6 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
-_SNIP_SAFETY_BUFFER = 1024
-_MICROCOMPACT_KEEP_RECENT = 10
-_MICROCOMPACT_MIN_CHARS = 500
-_COMPACTABLE_TOOLS = frozenset({
-    "read_file", "exec", "grep", "glob",
-    "web_search", "web_fetch", "list_dir",
-})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 
 
@@ -73,6 +64,10 @@ class AgentRunSpec:
     progress_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    turn_id: str | None = None
+    active_revision: int | None = None
+    revision_provider: Any | None = None
+    tool_execution_sink: "ToolExecutionSink | None" = None
 
 
 @dataclass(slots=True)
@@ -87,6 +82,19 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+
+
+class ToolExecutionSink(Protocol):
+    """Structured tool execution callbacks coordinated by the outer loop."""
+
+    async def on_declared_tool_calls(self, turn_id: str, tool_calls: list[dict[str, Any]]) -> None:
+        """Record the tool calls declared for a turn."""
+
+    async def on_completed_tool_result(self, turn_id: str, result: dict[str, Any]) -> None:
+        """Record one tool result that is still eligible for commit."""
+
+    async def on_artifact_persisted(self, turn_id: str, artifact: dict[str, Any]) -> None:
+        """Record a persisted audit artifact."""
 
 
 class AgentRunner:
@@ -224,6 +232,7 @@ class AgentRunner:
         return injected_messages
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self._validate_tool_sink_context(spec)
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         final_content: str | None = None
@@ -246,12 +255,7 @@ class AgentRunner:
                 # later when the caller saves only the new turn.
                 messages_for_model = self._drop_orphan_tool_results(messages)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-                messages_for_model = self._microcompact(messages_for_model)
                 messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
-                messages_for_model = self._snip_history(spec, messages_for_model)
-                # Snipping may have created new orphans; clean them up.
-                messages_for_model = self._drop_orphan_tool_results(messages_for_model)
-                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
             except Exception as exc:
                 logger.warning(
                     "Context governance failed on turn {} for {}: {}; applying minimal repair",
@@ -283,8 +287,17 @@ class AgentRunner:
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
+                declared_revision = await self._get_active_revision(spec)
+                structured_tool_calls = self._build_structured_tool_calls(
+                    response.tool_calls,
+                    declared_revision=declared_revision,
+                )
                 messages.append(assistant_message)
                 tools_used.extend(tc.name for tc in response.tool_calls)
+                await self._emit_declared_tool_calls(
+                    spec,
+                    structured_tool_calls,
+                )
                 await self._emit_checkpoint(
                     spec,
                     {
@@ -293,7 +306,7 @@ class AgentRunner:
                         "model": spec.model,
                         "assistant_message": assistant_message,
                         "completed_tool_results": [],
-                        "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                        "pending_tool_calls": structured_tool_calls,
                     },
                 )
 
@@ -308,7 +321,25 @@ class AgentRunner:
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
-                for tool_call, result in zip(response.tool_calls, results):
+                for tool_call, result, structured_tool_call in zip(
+                    response.tool_calls,
+                    results,
+                    structured_tool_calls,
+                ):
+                    declared_revision = int(structured_tool_call.get("declared_revision", 0))
+                    current_revision = await self._get_active_revision(spec)
+                    is_stale = (
+                        current_revision is not None
+                        and current_revision != declared_revision
+                    )
+                    artifact = self._persist_tool_artifact(
+                        spec,
+                        tool_call,
+                        result,
+                        declared_revision=declared_revision,
+                        invalidated_by=["stale_revision"] if is_stale else [],
+                        eligible_for_commit=not is_stale,
+                    )
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -318,10 +349,23 @@ class AgentRunner:
                             tool_call.id,
                             tool_call.name,
                             result,
+                            artifact=artifact,
                         ),
+                        "declared_revision": declared_revision,
                     }
+                    if artifact is not None:
+                        tool_message["artifact_ref"] = artifact["artifact_ref"]
+                    if current_revision is not None:
+                        tool_message["active_revision"] = current_revision
+                    if is_stale:
+                        tool_message["stale"] = True
+                        tool_message["eligible_for_commit"] = False
                     messages.append(tool_message)
-                    completed_tool_results.append(tool_message)
+                    if artifact is not None:
+                        await self._emit_artifact_persisted(spec, artifact)
+                    if not is_stale:
+                        completed_tool_results.append(tool_message)
+                        await self._emit_completed_tool_result(spec, tool_message)
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
@@ -721,6 +765,101 @@ class AgentRunner:
             await callback(payload)
 
     @staticmethod
+    def _validate_tool_sink_context(spec: AgentRunSpec) -> None:
+        if spec.tool_execution_sink is None:
+            return
+        if not spec.turn_id or not spec.session_key:
+            raise ValueError("ToolExecutionSink requires turn_id and session_key context")
+        if spec.active_revision is None and spec.revision_provider is None:
+            raise ValueError("ToolExecutionSink requires active revision context")
+
+    async def _get_active_revision(self, spec: AgentRunSpec) -> int | None:
+        provider = spec.revision_provider
+        if provider is None:
+            if isinstance(spec.active_revision, int):
+                return spec.active_revision
+            return None
+        try:
+            value = provider()
+            if inspect.isawaitable(value):
+                value = await value
+        except Exception:
+            logger.exception("revision_provider failed")
+            return spec.active_revision if isinstance(spec.active_revision, int) else None
+        return int(value) if isinstance(value, int) else (
+            spec.active_revision if isinstance(spec.active_revision, int) else None
+        )
+
+    @staticmethod
+    def _build_structured_tool_calls(
+        tool_calls: list[ToolCallRequest],
+        *,
+        declared_revision: int | None,
+    ) -> list[dict[str, Any]]:
+        revision = declared_revision if isinstance(declared_revision, int) else 0
+        return [
+            {
+                **tool_call.to_openai_tool_call(),
+                "declared_revision": revision,
+            }
+            for tool_call in tool_calls
+        ]
+
+    async def _emit_declared_tool_calls(
+        self,
+        spec: AgentRunSpec,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        sink = spec.tool_execution_sink
+        if sink is not None and spec.turn_id:
+            await sink.on_declared_tool_calls(spec.turn_id, tool_calls)
+
+    async def _emit_completed_tool_result(
+        self,
+        spec: AgentRunSpec,
+        result: dict[str, Any],
+    ) -> None:
+        sink = spec.tool_execution_sink
+        if sink is not None and spec.turn_id:
+            await sink.on_completed_tool_result(spec.turn_id, result)
+
+    async def _emit_artifact_persisted(
+        self,
+        spec: AgentRunSpec,
+        artifact: dict[str, Any],
+    ) -> None:
+        sink = spec.tool_execution_sink
+        if sink is not None and spec.turn_id:
+            await sink.on_artifact_persisted(spec.turn_id, artifact)
+
+    def _persist_tool_artifact(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        result: Any,
+        *,
+        declared_revision: int,
+        invalidated_by: list[str],
+        eligible_for_commit: bool,
+    ) -> dict[str, Any] | None:
+        if spec.workspace is None or not spec.session_key or not spec.turn_id:
+            return None
+        artifact_id = f"artifact_{tool_call.id}"
+        return persist_tool_artifact(
+            workspace=spec.workspace,
+            session_key=spec.session_key,
+            turn_id=spec.turn_id,
+            artifact_id=artifact_id,
+            tool_call_id=tool_call.id,
+            source_type=tool_call.name,
+            source_input=tool_call.arguments,
+            payload=ensure_nonempty_tool_result(tool_call.name, result),
+            declared_revision=declared_revision,
+            invalidated_by=invalidated_by,
+            eligible_for_commit=eligible_for_commit,
+        )
+
+    @staticmethod
     def _append_final_message(messages: list[dict[str, Any]], content: str | None) -> None:
         if not content:
             return
@@ -747,8 +886,12 @@ class AgentRunner:
         tool_call_id: str,
         tool_name: str,
         result: Any,
+        *,
+        artifact: dict[str, Any] | None = None,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        if artifact is not None:
+            return artifact.get("prompt_render") or result
         try:
             content = maybe_persist_tool_result(
                 spec.workspace,
@@ -836,32 +979,6 @@ class AgentRunner:
             offset += 1
         return updated
 
-    @staticmethod
-    def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace old compactable tool results with one-line summaries."""
-        compactable_indices: list[int] = []
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
-                compactable_indices.append(idx)
-
-        if len(compactable_indices) <= _MICROCOMPACT_KEEP_RECENT:
-            return messages
-
-        stale = compactable_indices[: len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT]
-        updated: list[dict[str, Any]] | None = None
-        for idx in stale:
-            msg = messages[idx]
-            content = msg.get("content")
-            if not isinstance(content, str) or len(content) < _MICROCOMPACT_MIN_CHARS:
-                continue
-            name = msg.get("name", "tool")
-            summary = f"[{name} result omitted from context]"
-            if updated is None:
-                updated = [dict(m) for m in messages]
-            updated[idx]["content"] = summary
-
-        return updated if updated is not None else messages
-
     def _apply_tool_result_budget(
         self,
         spec: AgentRunSpec,
@@ -882,65 +999,6 @@ class AgentRunner:
                     updated = [dict(m) for m in messages]
                 updated[idx]["content"] = normalized
         return updated
-
-    def _snip_history(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not messages or not spec.context_window_tokens:
-            return messages
-
-        provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
-        max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
-            provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
-        )
-        budget = spec.context_block_limit or (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        )
-        if budget <= 0:
-            return messages
-
-        estimate, _ = estimate_prompt_tokens_chain(
-            self.provider,
-            spec.model,
-            messages,
-            spec.tools.get_definitions(),
-        )
-        if estimate <= budget:
-            return messages
-
-        system_messages = [dict(msg) for msg in messages if msg.get("role") == "system"]
-        non_system = [dict(msg) for msg in messages if msg.get("role") != "system"]
-        if not non_system:
-            return messages
-
-        system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
-        kept: list[dict[str, Any]] = []
-        kept_tokens = 0
-        for message in reversed(non_system):
-            msg_tokens = estimate_message_tokens(message)
-            if kept and kept_tokens + msg_tokens > remaining_budget:
-                break
-            kept.append(message)
-            kept_tokens += msg_tokens
-        kept.reverse()
-
-        if kept:
-            for i, message in enumerate(kept):
-                if message.get("role") == "user":
-                    kept = kept[i:]
-                    break
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        if not kept:
-            kept = non_system[-min(len(non_system), 4) :]
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        return system_messages + kept
 
     def _partition_tool_batches(
         self,

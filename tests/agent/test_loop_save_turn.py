@@ -90,62 +90,67 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     assert session.messages[0]["content"] == content
 
 
-def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> None:
-    loop = _mk_loop()
-    session = Session(
-        key="test:checkpoint",
-        metadata={
-            AgentLoop._RUNTIME_CHECKPOINT_KEY: {
-                "assistant_message": {
-                    "role": "assistant",
-                    "content": "working",
-                    "tool_calls": [
-                        {
-                            "id": "call_done",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": "{}"},
-                        },
-                        {
-                            "id": "call_pending",
-                            "type": "function",
-                            "function": {"name": "exec", "arguments": "{}"},
-                        },
-                    ],
-                },
-                "completed_tool_results": [
+def test_restore_turn_state_rehydrates_completed_and_pending_tools(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("test:checkpoint")
+    turn_state = loop.create_turn_state(session.key)
+    turn_state = loop._advance_turn_state(
+        turn_state,
+        current_stage="interrupted",
+        declared_tool_calls=[
+            {
+                "id": "call_done",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            },
+            {
+                "id": "call_pending",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{}"},
+            },
+        ],
+        completed_tool_results=[
+            {
+                "role": "tool",
+                "tool_call_id": "call_done",
+                "name": "read_file",
+                "content": "ok",
+            }
+        ],
+        error_state={
+            "checkpoint_assistant_message": {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
                     {
-                        "role": "tool",
-                        "tool_call_id": "call_done",
-                        "name": "read_file",
-                        "content": "ok",
-                    }
-                ],
-                "pending_tool_calls": [
+                        "id": "call_done",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    },
                     {
                         "id": "call_pending",
                         "type": "function",
                         "function": {"name": "exec", "arguments": "{}"},
-                    }
+                    },
                 ],
             }
         },
     )
 
-    restored = loop._restore_runtime_checkpoint(session)
+    restored = loop._restore_turn_state(session)
 
     assert restored is True
-    assert session.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is None
     assert session.messages[0]["role"] == "assistant"
     assert session.messages[1]["tool_call_id"] == "call_done"
     assert session.messages[2]["tool_call_id"] == "call_pending"
     assert "interrupted before this tool finished" in session.messages[2]["content"].lower()
 
 
-def test_restore_runtime_checkpoint_dedupes_overlapping_tail() -> None:
-    loop = _mk_loop()
-    session = Session(
-        key="test:checkpoint-overlap",
-        messages=[
+def test_restore_turn_state_dedupes_overlapping_tail(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("test:checkpoint-overlap")
+    session.messages.extend(
+        [
             {
                 "role": "assistant",
                 "content": "working",
@@ -168,48 +173,56 @@ def test_restore_runtime_checkpoint_dedupes_overlapping_tail() -> None:
                 "name": "read_file",
                 "content": "ok",
             },
+        ]
+    )
+    loop.sessions.save(session)
+    turn_state = loop.create_turn_state(session.key)
+    turn_state = loop._advance_turn_state(
+        turn_state,
+        current_stage="interrupted",
+        declared_tool_calls=[
+            {
+                "id": "call_done",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            },
+            {
+                "id": "call_pending",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{}"},
+            },
         ],
-        metadata={
-            AgentLoop._RUNTIME_CHECKPOINT_KEY: {
-                "assistant_message": {
-                    "role": "assistant",
-                    "content": "working",
-                    "tool_calls": [
-                        {
-                            "id": "call_done",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": "{}"},
-                        },
-                        {
-                            "id": "call_pending",
-                            "type": "function",
-                            "function": {"name": "exec", "arguments": "{}"},
-                        },
-                    ],
-                },
-                "completed_tool_results": [
+        completed_tool_results=[
+            {
+                "role": "tool",
+                "tool_call_id": "call_done",
+                "name": "read_file",
+                "content": "ok",
+            }
+        ],
+        error_state={
+            "checkpoint_assistant_message": {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
                     {
-                        "role": "tool",
-                        "tool_call_id": "call_done",
-                        "name": "read_file",
-                        "content": "ok",
-                    }
-                ],
-                "pending_tool_calls": [
+                        "id": "call_done",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    },
                     {
                         "id": "call_pending",
                         "type": "function",
                         "function": {"name": "exec", "arguments": "{}"},
-                    }
+                    },
                 ],
             }
         },
     )
 
-    restored = loop._restore_runtime_checkpoint(session)
+    restored = loop._restore_turn_state(session)
 
     assert restored is True
-    assert session.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is None
     assert len(session.messages) == 3
     assert session.messages[0]["role"] == "assistant"
     assert session.messages[1]["tool_call_id"] == "call_done"
@@ -230,8 +243,12 @@ async def test_process_message_persists_user_message_before_turn_completes(tmp_p
     persisted = loop.sessions.get_or_create("feishu:c1")
     assert [m["role"] for m in persisted.messages] == ["user"]
     assert persisted.messages[0]["content"] == "persist me"
-    assert persisted.metadata.get(AgentLoop._PENDING_USER_TURN_KEY) is True
+    assert persisted.metadata == {}
     assert persisted.updated_at >= persisted.created_at
+    turn_state = loop.sessions.load_active_turn_state("feishu:c1")
+    assert turn_state is not None
+    assert turn_state["current_stage"] == "interrupted"
+    assert turn_state["user_message_ref"].startswith("message:")
 
 
 @pytest.mark.asyncio
@@ -264,19 +281,27 @@ async def test_process_message_does_not_duplicate_early_persisted_user_message(t
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "done"},
     ]
-    assert AgentLoop._PENDING_USER_TURN_KEY not in session.metadata
+    assert session.metadata == {}
 
 
 @pytest.mark.asyncio
-async def test_next_turn_after_crash_closes_pending_user_turn_before_new_input(tmp_path: Path) -> None:
+async def test_next_turn_after_interrupted_turn_restores_before_new_input(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
     loop.provider.chat_with_retry = AsyncMock(return_value=MagicMock())  # unused because _run_agent_loop is stubbed
 
     session = loop.sessions.get_or_create("feishu:c3")
     session.add_message("user", "old question")
-    session.metadata[AgentLoop._PENDING_USER_TURN_KEY] = True
     loop.sessions.save(session)
+    active_turn = loop.create_turn_state(session.key)
+    active_turn = loop._register_turn_message(
+        session,
+        active_turn,
+        role="user",
+        content="old question",
+        is_injection=False,
+    )
+    loop._interrupt_turn(session)
 
     loop._run_agent_loop = AsyncMock(return_value=(
         "new answer",
@@ -308,11 +333,11 @@ async def test_next_turn_after_crash_closes_pending_user_turn_before_new_input(t
         {"role": "user", "content": "new question"},
         {"role": "assistant", "content": "new answer"},
     ]
-    assert AgentLoop._PENDING_USER_TURN_KEY not in session.metadata
+    assert session.metadata == {}
 
 
 @pytest.mark.asyncio
-async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -> None:
+async def test_stop_preserves_turn_state_checkpoint_for_next_turn(tmp_path: Path) -> None:
     from nanobot.command.builtin import cmd_stop
     from nanobot.command.router import CommandContext
 
@@ -323,7 +348,7 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
 
     async def interrupted_run_agent_loop(_initial_messages, *, session=None, **_kwargs):
         assert session is not None
-        loop._set_runtime_checkpoint(
+        loop._sync_turn_state_from_checkpoint(
             session,
             {
                 "assistant_message": {
@@ -378,8 +403,11 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
 
     loop.sessions.invalidate("feishu:c4")
     interrupted = loop.sessions.get_or_create("feishu:c4")
-    assert interrupted.metadata.get(AgentLoop._PENDING_USER_TURN_KEY) is True
-    assert interrupted.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is not None
+    assert interrupted.metadata == {}
+    interrupted_turn = loop.sessions.load_active_turn_state("feishu:c4")
+    assert interrupted_turn is not None
+    assert interrupted_turn["current_stage"] == "interrupted"
+    assert interrupted_turn["resume_action"] == "await_tools"
 
     async def resumed_run_agent_loop(initial_messages, **_kwargs):
         return (
@@ -415,5 +443,8 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
         {"role": "user", "content": "continue here"},
         {"role": "assistant", "content": "next answer"},
     ]
-    assert AgentLoop._PENDING_USER_TURN_KEY not in session.metadata
-    assert AgentLoop._RUNTIME_CHECKPOINT_KEY not in session.metadata
+    assert session.metadata == {}
+    assert loop.sessions.load_active_turn_state("feishu:c4") is None
+    latest_turn = loop.sessions.load_latest_turn_state("feishu:c4")
+    assert latest_turn is not None
+    assert latest_turn["current_stage"] == "completed"
