@@ -11,6 +11,8 @@ TRACKED = [
     "identity/USER_RULES.md",
     "identity/USER_PROFILE.md",
     "working/CURRENT.md",
+    "AGENTS.md",
+    "HEARTBEAT.md",
 ]
 
 
@@ -39,6 +41,24 @@ class TestInit:
     def test_init_idempotent(self, git_ready):
         assert not git_ready.init()
 
+    def test_init_refreshes_tracked_layout_for_existing_repo(self, tmp_path):
+        old = GitStore(tmp_path, tracked_files=[
+            "identity/SOUL.md",
+            "identity/USER_RULES.md",
+            "identity/USER_PROFILE.md",
+            "working/CURRENT.md",
+        ])
+        assert old.init()
+
+        refreshed = GitStore(tmp_path, tracked_files=TRACKED)
+        assert not refreshed.init()
+
+        content = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+        assert "!AGENTS.md\n" in content
+        assert "!HEARTBEAT.md\n" in content
+        assert (tmp_path / "AGENTS.md").exists()
+        assert (tmp_path / "HEARTBEAT.md").exists()
+
     def test_init_creates_gitignore(self, git_ready):
         gi = git_ready._workspace / ".gitignore"
         assert gi.exists()
@@ -62,6 +82,8 @@ class TestBuildGitignore:
         assert "!identity/\n" in content
         assert "!working/\n" in content
         assert "!memory/\n" not in content
+        assert "!AGENTS.md\n" in content
+        assert "!HEARTBEAT.md\n" in content
         for f in TRACKED:
             assert f"!{f}\n" in content
         assert content.startswith("/*\n")
@@ -95,6 +117,29 @@ class TestAutoCommit:
         commits = git_ready.log()
         assert len(commits) == 2
         assert commits[0].sha == sha
+
+    def test_commits_root_level_tracked_file_change(self, git_ready):
+        (git_ready._workspace / "AGENTS.md").write_text("updated instructions", encoding="utf-8")
+        sha = git_ready.auto_commit("update agents")
+        assert sha is not None
+        assert git_ready.log()[0].sha == sha
+
+    def test_commits_newly_tracked_file_in_existing_repo(self, tmp_path):
+        old = GitStore(tmp_path, tracked_files=[
+            "identity/SOUL.md",
+            "identity/USER_RULES.md",
+            "identity/USER_PROFILE.md",
+            "working/CURRENT.md",
+        ])
+        assert old.init()
+
+        refreshed = GitStore(tmp_path, tracked_files=TRACKED)
+        refreshed.init()
+        (tmp_path / "AGENTS.md").write_text("custom agents", encoding="utf-8")
+
+        sha = refreshed.auto_commit("track agents")
+        assert sha is not None
+        assert refreshed.log()[0].sha == sha
 
     def test_does_not_create_empty_commits(self, git_ready):
         git_ready.auto_commit("nothing 1")

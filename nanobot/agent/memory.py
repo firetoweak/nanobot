@@ -18,19 +18,11 @@ from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.state import is_completed_manifest
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import GitStore, TRACKED_WORKSPACE_FILES
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
-
-
-TRACKED_MEMORY_FILES = [
-    "identity/SOUL.md",
-    "identity/USER_RULES.md",
-    "identity/USER_PROFILE.md",
-    "working/CURRENT.md",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +53,7 @@ class MemoryStore:
 
         self._cursor_file = self.archive_dir / ".cursor"
         self._dream_cursor_file = self.archive_dir / ".dream_cursor"
-        self._git = GitStore(workspace, tracked_files=TRACKED_MEMORY_FILES)
+        self._git = GitStore(workspace, tracked_files=TRACKED_WORKSPACE_FILES)
 
     @property
     def git(self) -> GitStore:

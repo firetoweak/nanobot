@@ -10,6 +10,16 @@ from pathlib import Path
 from loguru import logger
 
 
+TRACKED_WORKSPACE_FILES = [
+    "identity/SOUL.md",
+    "identity/USER_RULES.md",
+    "identity/USER_PROFILE.md",
+    "working/CURRENT.md",
+    "AGENTS.md",
+    "HEARTBEAT.md",
+]
+
+
 @dataclass
 class CommitInfo:
     sha: str  # Short SHA (8 chars)
@@ -25,7 +35,7 @@ class CommitInfo:
 
 
 class GitStore:
-    """Git-backed version control for memory files."""
+    """Git-backed version control for selected workspace files."""
 
     def __init__(self, workspace: Path, tracked_files: list[str]):
         self._workspace = workspace
@@ -44,24 +54,17 @@ class GitStore:
         Returns True if a new repo was created, False if already exists.
         """
         if self.is_initialized():
+            try:
+                self._sync_tracked_layout()
+            except Exception:
+                logger.warning("Git store sync failed for {}", self._workspace)
             return False
 
         try:
             from dulwich import porcelain
 
             porcelain.init(str(self._workspace))
-
-            # Write .gitignore
-            gitignore = self._workspace / ".gitignore"
-            gitignore.write_text(self._build_gitignore(), encoding="utf-8")
-
-            # Ensure tracked files exist (touch them if missing) so the initial
-            # commit has something to track.
-            for rel in self._tracked_files:
-                p = self._workspace / rel
-                p.parent.mkdir(parents=True, exist_ok=True)
-                if not p.exists():
-                    p.write_text("", encoding="utf-8")
+            self._sync_tracked_layout()
 
             # Initial commit
             porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
@@ -80,7 +83,7 @@ class GitStore:
     # -- daily operations ------------------------------------------------------
 
     def auto_commit(self, message: str) -> str | None:
-        """Stage tracked memory files and commit if there are changes.
+        """Stage tracked workspace files and commit if there are changes.
 
         Returns the short commit SHA, or None if nothing to commit.
         """
@@ -90,14 +93,13 @@ class GitStore:
         try:
             from dulwich import porcelain
 
-            # .gitignore excludes everything except tracked files,
-            # so any staged/unstaged change must be in our files.
+            self._sync_tracked_layout()
+            porcelain.add(str(self._workspace), paths=self._tracked_files)
             st = porcelain.status(str(self._workspace))
             if not st.unstaged and not any(st.staged.values()):
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -151,6 +153,17 @@ class GitStore:
             lines.append(f"!{f}")
         lines.append("!.gitignore")
         return "\n".join(lines) + "\n"
+
+    def _sync_tracked_layout(self) -> None:
+        """Refresh .gitignore and ensure tracked files exist."""
+        gitignore = self._workspace / ".gitignore"
+        gitignore.write_text(self._build_gitignore(), encoding="utf-8")
+
+        for rel in self._tracked_files:
+            p = self._workspace / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                p.write_text("", encoding="utf-8")
 
     # -- query -----------------------------------------------------------------
 
