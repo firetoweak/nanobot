@@ -1,290 +1,270 @@
 # nanobot 的记忆系统
 
-`nanobot` 的记忆设计建立在一个很重要的前提上：
+## 一句话总览
 
-不是所有“记住的内容”，都应该拥有同样的权限。
+`nanobot` 当前采用的是一套分层、分权限、结构化状态优先的记忆系统：
 
-有些信息会长期影响 agent 的行为和风格；有些只属于当前任务；有些适合归档检索，但不应该每次都被塞进 prompt；还有一些观察结论，暂时只能作为候选事实，不能直接升级成长期身份信息。
+- 运行时短期状态由 `.nanobot/state/` 下的结构化对象驱动
+- `working/CURRENT.md` 保留为镜像/交接视图
+- `archive/` 和 `candidate/` 负责归档、反思、候选晋升
+- `identity/` 才是默认直接影响长期行为的高权限记忆层
 
-因此，`nanobot` 采用的是一种**分层、分权限的记忆系统**。
+如果只记一句话，可以记成：
 
-## 一句话理解这套设计
+- `TurnState + WorkingSetSnapshot + CommitManifest` 决定当前任务和恢复
+- `CURRENT.md` 负责镜像展示，不再是运行时主真相源
+- `Dream + Promoter` 负责把已提交的结构化产物沉淀到更长期的记忆层
 
-如果用最直白的话来讲：
+## 1. 记忆分层
 
-- `identity` 是“真正长期生效的记忆”
-- `working` 是“当前工作台”
-- `archive` 是“可检索档案”
-- `candidate` 是“待审核候选区”
+### 1.1 运行时短期层
 
-这样设计的目标，不只是为了省上下文长度，更是为了防止错误总结被过早提升为长期事实。
-
-## 记忆分层结构
-
-`nanobot` 会把不同性质的记忆拆到不同层里：
-
-- `session.messages`：当前会话中的实时短期消息
-- `identity/`：允许直接影响 prompt 的长期身份与用户信息
-- `working/CURRENT.md`：当前任务的工作上下文、交接状态和短期待办
-- `archive/`：面向机器检索和回顾的历史摘要、反思记录
-- `candidate/observations.jsonl`：尚未被确认的观察、候选结论和待晋升内容
-- `GitStore`：对关键记忆文件做版本记录，便于审计和恢复
-
-这套设计的核心收益是：
-
-- 当前运行时保持轻量
-- 长期信息可以积累
-- 但不会让每次摘要都直接污染系统身份
-
-## 目录结构
+当前短期运行时主链位于 `.nanobot/state/`：
 
 ```text
-workspace/
-├── identity/
-│   ├── SOUL.md
-│   ├── USER_RULES.md
-│   └── USER_PROFILE.md
-├── working/
-│   └── CURRENT.md
-├── archive/
-│   ├── history.jsonl
-│   ├── reflections.jsonl
-│   ├── .cursor
-│   └── .dream_cursor
-├── candidate/
-│   └── observations.jsonl
+.nanobot/state/
+  sessions/<session_key>/
+    turns/
+    messages/
+    responses/
+    working-set/
+    capsules/
+    artifacts/
+    commits/
+    indexes/
 ```
 
-各文件的职责可以这样理解：
+这层保存的是结构化执行状态，而不是给人读的自由文本。
 
-| 路径 | 用途 |
-|------|------|
-| `identity/SOUL.md` | agent 的稳定原则、风格、边界 |
-| `identity/USER_RULES.md` | 用户长期有效的明确规则和工作约束 |
-| `identity/USER_PROFILE.md` | 用户背景、稳定偏好、长期事实 |
-| `working/CURRENT.md` | 当前活跃任务的工作记忆和交接信息 |
-| `archive/history.jsonl` | 会话摘要历史，追加写入 |
-| `archive/reflections.jsonl` | Dream / Heartbeat 生成的反思记录 |
-| `candidate/observations.jsonl` | 候选观察结论，待复核、待晋升 |
+关键对象包括：
 
-## 哪些记忆会直接进入 Prompt
+- `TurnState`：当前 turn 在做什么、做到哪一步
+- `WorkingSetSnapshot`：当前稳定工作集
+- `TurnCapsule`：一轮完成后的结构化结论
+- `ArtifactRecord`：工具结果及其 render/digest
+- `CommitManifest`：稳定完成判据
 
-默认情况下，只有下面这些内容会被注入核心系统 prompt：
+### 1.2 镜像层
+
+`working/CURRENT.md` 仍然存在，但现在属于镜像层：
+
+- 方便人读
+- 方便 handoff
+- 可以被 Dream 更新
+- 在部分 prompt 模板中保留兼容注入
+
+但它不再承担：
+
+- 当前运行时主状态
+- 恢复判定
+- Dream 的主输入真相源
+
+### 1.3 审计与检索层
+
+下面这些内容主要服务于审计、检索和兼容：
+
+- `session.messages`
+- `sessions/*.jsonl`
+- `archive/history.jsonl`
+- `archive/reflections.jsonl`
+
+它们仍然重要，但不再是当前任务状态的唯一来源。
+
+### 1.4 候选与长期层
+
+- `candidate/observations.jsonl`：候选观察、待审核结论
+- `identity/SOUL.md`：稳定助手原则
+- `identity/USER_RULES.md`：稳定用户规则
+- `identity/USER_PROFILE.md`：稳定用户画像
+
+这层的关键目标是：让“记录下来”与“真正影响未来行为”之间有明确权限边界。
+
+## 2. 运行时短期层
+
+### 2.1 当前任务靠什么维持
+
+当前一轮任务的执行与恢复主要依赖：
+
+- `TurnState`
+- `WorkingSetSnapshot`
+- 最近合法 `Recent Raw Turns`
+- `TurnCapsule` / `ArtifactRecord` 补充信息
+
+其中：
+
+- `TurnState` 管执行过程
+- `WorkingSetSnapshot` 管稳定工作内存
+- `CommitManifest` 管稳定完成
+
+### 2.2 Prompt 看什么
+
+当前 prompt 不是简单把 `session.messages` 全塞给模型，而是按分层组装：
+
+1. `System Prefix`
+2. `WorkingSetSnapshot`
+3. `Recent Raw Turns`
+4. `Selected TurnCapsules`
+5. `Selected Artifact Render`
+6. `Current User Message`
+
+这意味着：
+
+- 工作集优先于原始历史
+- 原始历史只保留最近合法尾部
+- 大工具结果默认以 render/digest 视图进入 prompt
+
+### 2.3 原始消息还在做什么
+
+`session.messages` 和 `last_consolidated` 没有消失，但它们当前主要承担：
+
+- 原始会话审计
+- `Recent Raw Turns` 的来源
+- Consolidator 的归档输入
+
+它们不再是短期运行时主工作内存。
+
+## 3. 稳定提交层
+
+### 3.1 什么叫“这轮真的完成了”
+
+在当前架构里，一轮 turn 是否稳定完成，不是只看 `current_stage == completed`。
+
+真正的完成判据是：
+
+- `TurnState.commit_state == committed`
+- `TurnState.commit_manifest_ref` 指向有效 manifest
+- `CommitManifest.completed_marker == True`
+- manifest 引用的核心对象可以解析
+
+因此，`CommitManifest` 是稳定完成的唯一正式判据。
+
+### 3.2 为什么要有稳定提交层
+
+它解决了几个老问题：
+
+- 不再只靠消息链猜测完成状态
+- 恢复时能区分“已完成”“半提交”“仍在执行”
+- Dream、AutoCompact、Prompt 可以消费同一套稳定对象
+
+### 3.3 这层产出什么
+
+一轮完成后，主链会产出：
+
+- `TurnCapsule`
+- `WorkingSetSnapshot`
+- `ResponseObject`
+- `CommitManifest`
+
+这些对象共同构成后续恢复、压缩、长期沉淀的输入。
+
+## 4. 长期记忆与晋升层
+
+### 4.1 Consolidator
+
+`Consolidator` 仍负责把旧原始消息沉淀进 `archive/history.jsonl`。
+
+它的职责是：
+
+- 减轻原始历史尾部压力
+- 生成归档材料
+- 为后续 Dream/检索提供辅助输入
+
+它不是当前短期状态的唯一组织者。
+
+### 4.2 Dream
+
+`Dream` 当前处理的是 committed turn 的结构化产物，而不是主要靠 `CURRENT.md + history.jsonl` 反推当前状态。
+
+Dream 的输入重点是：
+
+- `TurnCapsule`
+- `WorkingSetSnapshot`
+- artifact digests / renders
+- candidate signals
+
+Dream 的输出目标包括：
+
+- `working/CURRENT.md` 的镜像更新
+- `archive/reflections.jsonl`
+- `candidate/observations.jsonl`
+- 必要时技能文件
+
+Dream 不直接写 `identity/*`。
+
+### 4.3 Promoter
+
+`Promoter` 是候选层到身份层的权限边界。
+
+它从 `candidate/observations.jsonl` 读取候选结论，并决定是否晋升到：
 
 - `identity/SOUL.md`
 - `identity/USER_RULES.md`
 - `identity/USER_PROFILE.md`
-- `working/CURRENT.md`
 
-而下面这些内容**默认不会**直接注入 prompt：
+因此，长期行为改变不是 Dream 直接决定的，而是经过候选层和晋升判断。
 
-- `archive/history.jsonl`
-- `archive/reflections.jsonl`
-- `candidate/observations.jsonl`
+## 5. CURRENT.md 和 history.jsonl 现在还剩什么职责
 
-这条边界非常关键。
+### 5.1 working/CURRENT.md
 
-它意味着：
+现在的 `working/CURRENT.md` 更接近：
 
-- 档案可以很多，但不需要每次都带进上下文
-- 候选观察可以被记录，但不会立刻影响 agent 的长期行为
-- 真正会改变 agent 行为的，只能是被提升到 `identity/` 的内容
+- 当前结构化状态的人类可读镜像
+- handoff 视图
+- 兼容文本层
 
-## 记忆是怎样流动的
+它不再是：
 
-与其把所有长期信息都扔进一个“大记忆桶”，`nanobot` 采用了一个分阶段流转模型。你可以把它理解成四个阶段。
+- 当前任务的唯一工作记忆
+- 恢复入口
+- commit 完成判据
 
-## 阶段 1：Consolidator
+### 5.2 archive/history.jsonl
 
-当对话越来越长、开始挤压上下文窗口时，`Consolidator` 会把“足够老、可以安全摘要”的那部分会话压缩后写入 `archive/history.jsonl`。
+现在的 `archive/history.jsonl` 更接近：
 
-这个文件有几个特征：
+- 归档历史
+- 检索材料
+- Dream/分析流程的辅助输入
 
-- 只追加，不回写历史
-- 用 cursor 跟踪写入进度
-- 优先服务于机器消费，其次才是人工查看
+它不再是：
 
-每一行都是一条 JSON 记录，例如：
+- prompt 默认主输入
+- 当前执行阶段的判定依据
 
-```json
-{"cursor": 42, "timestamp": "2026-04-03 00:02", "content": "- User prefers dark mode\n- Decided to use PostgreSQL"}
-```
+## 6. 为什么要这样分层
 
-你可以把它理解成“对旧对话的结构化摘要流水账”。
+这样做的好处不只是“省 token”，更重要的是把不同类型的信息分权：
 
-## 阶段 2：Dream
+- 当前执行状态交给结构化状态对象
+- 人类可读摘要放进镜像层
+- 归档和检索放进 archive
+- 候选结论留在 candidate
+- 真正长期生效的内容才进入 identity
 
-`Dream` 是一个更慢、更偏反思性质的层。
+这样可以避免两类常见问题：
 
-它通常按计划定时运行，也可以手动触发。它会读取：
+1. 把临时状态误当成长期事实
+2. 把历史材料误当成当前运行时主状态
 
-- `archive/history.jsonl` 里的新增摘要
-- 当前已有的分层记忆状态
+## 7. 对外理解这套系统的方式
 
-但要注意，`Dream` 默认**不会直接改写 `identity/`**。它的常规写入目标是：
+如果你要判断某类信息应该看哪里，可以按下面理解：
 
-- `working/CURRENT.md`
-- `archive/reflections.jsonl`
-- `candidate/observations.jsonl`
+- 看“现在这轮做到哪了”：`TurnState`
+- 看“当前稳定工作上下文”：`WorkingSetSnapshot`
+- 看“这轮是否稳定完成”：`CommitManifest`
+- 看“这轮沉淀了什么结论”：`TurnCapsule`
+- 看“工具结果留下了什么可复用证据”：`ArtifactRecord`
+- 看“给人读的当前交接摘要”：`working/CURRENT.md`
+- 看“历史归档和检索材料”：`archive/history.jsonl`
+- 看“待审核候选结论”：`candidate/observations.jsonl`
+- 看“真正长期影响 agent 的内容”：`identity/*`
 
-这样做的目的是把“反思”和“真正有权限的长期身份信息”分开。
+## 8. 相关文档
 
-换句话说，Dream 可以提出结论，但不能直接自封为真理。
+- `docs/上下文工作集优化方案.md`：短期上下文主链与 prompt 组装合同
+- `docs/回合状态恢复优化方案.md`：恢复、提交、repair 合同
+- `docs/MEMORY_PROMOTION_ARCHITECTURE.md`：记忆晋升与权限边界
 
-## 阶段 3：Promoter
-
-`Promoter` 是候选记忆和身份记忆之间的权限边界。
-
-它会审查 `candidate/observations.jsonl` 中的条目，并决定某条观察应该：
-
-- 继续留在候选区
-- 被拒绝
-- 或晋升到以下长期记忆中：
-  - `identity/SOUL.md`
-  - `identity/USER_RULES.md`
-  - `identity/USER_PROFILE.md`
-
-初版实现更偏向保守，通常会优先采纳以下这类证据：
-
-- 用户明确直接表达过的事实
-- 跨多个会话重复出现、证据稳定的结论
-
-这能避免某次 Dream 的抽象过度，直接污染长期身份层。
-
-## 阶段 4：Heartbeat 与后台任务
-
-Heartbeat 作业和其他后台任务也可以写记忆，但权限会被严格限制。
-
-通常它们只能写入这类目标：
-
-- `working/CURRENT.md`
-- `archive/reflections.jsonl`
-
-它们不会被授予整个记忆树的广泛写权限。
-
-## 为什么一定要做分层记忆
-
-旧式“单桶记忆”的优点是简单，但它有一个很危险的问题：
-
-从历史里提炼出来的一次摘要，太容易被误当成长期事实。
-
-而分层记忆通过权限拆分，把下面几类东西明确分开了：
-
-- 可以长期塑造未来行为的身份信息
-- 应该随着任务结束而过期的工作状态
-- 适合检索但不该总是注入 prompt 的归档内容
-- 需要观察、审核、晋升流程的候选结论
-
-所以它要解决的不只是“记忆错误”问题，更是“权限升级”问题。
-
-一句话概括：很多记忆污染，本质上不是摘要错了，而是摘要被给了不该有的权限。
-
-## 如何搜索过去发生过的事
-
-如果你想查历史，不应该优先去看 prompt 层，而应该查 JSONL 档案：
-
-- `archive/history.jsonl`
-- `archive/reflections.jsonl`
-- `candidate/observations.jsonl`
-
-典型搜索方式：
-
-```bash
-# 搜索摘要历史
-rg -i "keyword" archive/history.jsonl
-
-# 搜索候选观察
-rg -i "prefers concise" candidate/observations.jsonl
-
-# 统计 archive 下 JSONL 里的命中项
-rg -i --glob "*.jsonl" "keyword" archive
-```
-
-这说明 `archive/` 和 `candidate/` 的主要职责是“检索、审阅、晋升”，而不是“默认注入提示词”。
-
-## 用户可直接使用的记忆命令
-
-记忆系统不是黑盒，用户可以直接查看和干预。
-
-| 命令 | 作用 |
-|------|------|
-| `/dream` | 立即执行一次 Dream |
-| `/dream-log` | 查看最近一次 Dream 对记忆的修改 |
-| `/dream-log <sha>` | 查看指定版本的 Dream 变更 |
-| `/dream-restore` | 列出最近可恢复的 Dream 版本 |
-| `/dream-restore <sha>` | 把记忆恢复到某次修改之前 |
-
-之所以提供这些命令，是因为自动记忆虽然强大，但用户仍应保有：
-
-- 查看权
-- 理解权
-- 恢复权
-
-## 关键记忆文件是可版本化的
-
-`GitStore` 会跟踪以下关键 prompt 记忆文件：
-
-- `identity/SOUL.md`
-- `identity/USER_RULES.md`
-- `identity/USER_PROFILE.md`
-- `working/CURRENT.md`
-
-这样做的意义是：
-
-- 你可以知道哪里被改了
-- 可以比较不同版本之间的差异
-- 也可以把系统恢复到更早的状态
-
-对于真正会影响 agent 行为的记忆，这是非常重要的可审计能力。
-
-## Dream 的配置方式
-
-`Dream` 的配置位于 `agents.defaults.dream`：
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "dream": {
-        "intervalH": 2,
-        "modelOverride": null,
-        "maxBatchSize": 20,
-        "maxIterations": 10
-      }
-    }
-  }
-}
-```
-
-各字段含义如下：
-
-| 字段 | 含义 |
-|------|------|
-| `intervalH` | Dream 运行间隔，单位小时 |
-| `modelOverride` | 是否为 Dream 单独指定模型 |
-| `maxBatchSize` | 每次 Dream 最多处理多少条历史摘要 |
-| `maxIterations` | Dream 编辑阶段允许使用的最大步骤数 |
-
-更实用一点的理解方式：
-
-- `modelOverride: null` 表示 Dream 默认沿用主 agent 的模型
-- `maxBatchSize` 决定 Dream 每轮吃掉多少条新的 `archive/history.jsonl` 记录
-- `maxIterations` 控制 Dream 在更新工作区、档案区、候选区时最多能进行多少轮读写操作
-- `intervalH` 是配置 Dream 周期运行的主要方式，内部按 `every` 调度，而不是传统 cron 表达式
-
-## 在日常使用里，它带来了什么
-
-分层记忆真正带来的不是“多几个目录”，而是更可控的长期连续性：
-
-- 对话不必一直背着无限长历史运行
-- 长期事实可以逐渐沉淀
-- 但不会因为一条可疑结论就立刻改变 agent 身份
-- 用户可以检查、回滚关键记忆
-
-## 最后总结
-
-这套记忆模型想达到的效果，不是把一切都存起来，而是把“该如何记住”这件事做成有权限边界的系统。
-
-你可以把它理解成一句话：
-
-**记忆不是一个垃圾堆，而是一套带审批流程的连续性系统。**
+如果需要理解“当前实现”，优先读上面三份；不要再把旧压缩分析文档当成现行权威说明。

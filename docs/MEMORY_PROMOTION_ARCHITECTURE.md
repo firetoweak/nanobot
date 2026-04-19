@@ -1,527 +1,224 @@
 # 当前记忆晋升架构说明
 
-本文基于当前代码实现梳理 nanobot 的“记忆晋升”架构，重点解释 4 件事：
+## 1. 文档角色
 
-1. 记忆是如何从会话内容一步步进入长期记忆的
-2. 各分区分别写什么、谁可以写、为什么这么分
-3. 晋升发生在什么时机，由哪些状态控制
-4. 当前实现的安全边界、回退能力与局限
+本文说明 nanobot 当前“长期记忆晋升”这条链路如何工作，重点描述：
 
-## 1. 一句话总览
+1. Dream 现在从哪里拿输入
+2. 哪些文件可以写、哪些不能写
+3. 候选观察如何进入长期身份记忆
+4. 为什么 `working/CURRENT.md` 不再是这条链的主真相源
 
-当前架构不是“总结完直接写进长期记忆”，而是一个分层、分权、带候选区的流水线：
+本文描述的是当前实现，不再沿用旧的 `session.messages -> history.jsonl -> CURRENT.md` 主通路叙述。
+
+## 2. 一句话总览
+
+当前记忆晋升主链可以概括成：
 
 ```text
-session.messages
-  -> Consolidator
-  -> archive/history.jsonl
+committed turn
+  -> CommitManifest
+  -> TurnCapsule + WorkingSetSnapshot + Artifact digests
   -> Dream
   -> working/CURRENT.md | archive/reflections.jsonl | candidate/observations.jsonl
   -> Promoter
   -> identity/SOUL.md | identity/USER_RULES.md | identity/USER_PROFILE.md
 ```
 
-它的核心目标不是“尽量多记”，而是“控制哪些记忆有资格影响未来 prompt”。
+它的核心目标不是“尽量多记”，而是“控制哪些结论有资格影响未来 prompt”。
 
-## 2. 分层与分区
+## 3. 分层与分区
 
-当前记忆系统可以理解为 5 个主要分区。
+### 3.1 结构化状态层
 
-### 2.1 `session.messages`
+记忆晋升链的上游不再是“当前短期状态靠 `CURRENT.md` 推断”，而是 committed turn 生成的结构化对象：
 
-- 这是在线会话的短期消息历史。
-- 用户和助手的真实对话先进入这里。
-- 它不是长期记忆文件，而是运行时会话状态。
-- 当上下文过长时，老消息会被 `Consolidator` 摘要后移出主上下文压力区。
+- `CommitManifest`
+- `TurnCapsule`
+- `WorkingSetSnapshot`
+- `ArtifactRecord` 的 digest / render
 
-### 2.2 `identity/`
+这一层的职责是给 Dream 提供已提交、可复用、可去重的事实输入。
 
-包含 3 个高权限文件：
+### 3.2 identity
 
-- `identity/SOUL.md`：稳定的助手原则、边界、风格
-- `identity/USER_RULES.md`：用户明确提出的长期规则
-- `identity/USER_PROFILE.md`：稳定用户画像、长期偏好、长期背景
-
-特点：
-
-- 这是高权限记忆层。
-- 默认会被注入 system prompt。
-- 不能由 Dream 直接写入。
-- 当前实现只能由 `Promoter` 把候选观察晋升进去。
-
-### 2.3 `working/CURRENT.md`
-
-- 保存当前活跃任务、短期 handoff、近期状态。
-- 会进入 system prompt。
-- 属于“可影响当前行为，但不应轻易永久化”的工作记忆层。
-- Dream 和 Heartbeat 都允许写这个文件。
-
-### 2.4 `archive/`
-
-主要包含：
-
-- `archive/history.jsonl`：由 `Consolidator` 追加写入的历史摘要
-- `archive/reflections.jsonl`：由 Dream / Heartbeat 追加写入的反思与归档笔记
-- `archive/.cursor`：`history.jsonl` 的游标
-- `archive/.dream_cursor`：Dream 已消费到哪里
-
-特点：
-
-- 这是机器友好的归档层，不默认注入 prompt。
-- 用于 Dream 后续消费、回顾、检索，而不是直接塑造身份。
-
-### 2.5 `candidate/observations.jsonl`
-
-- 这是候选记忆池。
-- Dream 会把“可能值得长期保留，但还不该直接进 identity 的内容”写到这里。
-- Promoter 只从这里读取并决定是否晋升或拒绝。
-
-它是整个架构中的“权限缓冲层”。
-
-## 3. 哪些记忆会进入 prompt
-
-当前默认只注入以下内容：
+高权限长期记忆层：
 
 - `identity/SOUL.md`
 - `identity/USER_RULES.md`
 - `identity/USER_PROFILE.md`
-- `working/CURRENT.md`
 
-以下内容默认不注入：
+特点：
+
+- 默认进入系统 prompt
+- 影响未来行为
+- Dream 不能直接写
+- 只有 Promoter 可以正式晋升进去
+
+### 3.3 working/CURRENT.md
+
+`working/CURRENT.md` 当前仍可被 Dream 更新，但它的角色已经降级为：
+
+- 镜像输出
+- handoff 视图
+- 人类可读的短期摘要
+
+它不是：
+
+- Dream 的主输入真相源
+- 当前运行时状态唯一来源
+- 长期身份层
+
+### 3.4 archive
+
+主要包含：
 
 - `archive/history.jsonl`
 - `archive/reflections.jsonl`
-- `candidate/observations.jsonl`
 
-这意味着：
+当前职责：
 
-- `identity/*` 和 `working/CURRENT.md` 是“行为影响层”
-- `archive/*` 和 `candidate/*` 是“存储/审核层”
+- 保存历史归档与反思材料
+- 提供可检索上下文
+- 给长期记忆处理链补充背景
 
-这是当前架构最重要的权限边界。
+它不是当前短期状态判定层。
 
-## 4. 记忆晋升的完整链路
+### 3.5 candidate/observations.jsonl
 
-## 4.1 第一段：会话压缩到归档
+候选记忆池，用于缓存：
 
-用户消息和助手消息先保存在 `session.messages` 中。
+- 尚未验证的观察
+- 晋升建议
+- 暂时不适合直接进入 identity 的结论
 
-当上下文 token 超预算时，`Consolidator.maybe_consolidate_by_tokens()` 会触发压缩：
+它是权限缓冲层，而不是长期事实层。
 
-- 估算当前 prompt token
-- 如果未超预算，不处理
-- 如果超预算，按“用户轮次边界”切一段旧消息
-- 调 LLM 生成摘要
-- 追加写入 `archive/history.jsonl`
-- 将会话的 `last_consolidated` 前移
+## 4. Dream 现在如何拿输入
 
-这里的关键点：
+当前 Dream 会遍历结构化状态目录，挑出满足以下条件的 turn：
 
-- `Consolidator` 只写 `archive/history.jsonl`
-- 它不写 `identity/*`
-- 它也不直接做“用户偏好晋升”
+- `TurnState.commit_state == committed`
+- `TurnState.commit_manifest_ref` 存在
+- manifest 自洽且 `completed_marker=True`
+- manifest revision 与 turn revision 一致
+- capsule、working set、artifact digests 可加载
 
-所以它只是把原始对话变成可供后续加工的“归档原料”。
+然后 Dream 为每个 turn 组装结构化输入：
 
-## 4.2 第二段：Dream 从归档提炼候选记忆
+```python
+DreamInput = {
+    "session_key": str,
+    "turn_id": str,
+    "capsule": dict,
+    "working_set_snapshot": dict | None,
+    "artifact_digests": list[dict],
+    "candidate_signals": list[dict],
+    "idempotency_key": str,
+}
+```
 
-Dream 是第二层处理器，分两阶段。
+关键点：
 
-### Phase 1：分析
+- 输入来自 committed turn，而不是从 `CURRENT.md + history.jsonl` 反推
+- `idempotency_key` 用于防止重复消费同一 turn
+- Dream cursor 现在记录的是结构化 turn 消费进度
 
-Dream 读取：
+## 5. Dream 的输出边界
 
-- `archive/history.jsonl` 中从 `.dream_cursor` 之后的新记录
-- 当前 `identity/*`
-- 当前 `working/CURRENT.md`
-- 最近的 `archive/reflections.jsonl`
-- 最近的 `candidate/observations.jsonl`
-
-然后让模型输出若干分析结果，按以下类型分类：
-
-- `[WORKING]`：应该进 `working/CURRENT.md`
-- `[REFLECTION]`：应该进 `archive/reflections.jsonl`
-- `[OBSERVATION]`：应该进 `candidate/observations.jsonl`
-- `[PROMOTION]`：仍然写进 `candidate/observations.jsonl`，但标记为更接近晋升的候选
-- `[SKILL]`：必要时生成技能文件
-
-### Phase 2：受限写入
-
-Dream 第二阶段通过受限工具落盘，但只允许写：
+Dream 现在允许写：
 
 - `working/CURRENT.md`
 - `archive/reflections.jsonl`
 - `candidate/observations.jsonl`
 - `skills/<name>/SKILL.md`
 
-明确禁止直接写：
+Dream 明确禁止直写：
 
 - `identity/SOUL.md`
 - `identity/USER_RULES.md`
 - `identity/USER_PROFILE.md`
 
-这意味着 Dream 即使分析出“这条内容很像用户长期规则”，当前实现也只能先把它写成 candidate observation，不能越权直写 identity。
+这条边界非常重要：Dream 可以提出结论，但不能直接把结论提升成长期身份事实。
 
-## 4.3 第三段：Promoter 执行真正的“晋升”
+## 6. working/CURRENT.md 的当前定位
 
-Promoter 是候选层到身份层的唯一正式晋升器。
+Dream 当前文件上下文里已经明确写出：
 
-它的处理流程是：
+- `working/CURRENT.md` 是 mirror-only output
+- 不应被当作 source of truth
+
+因此 Dream 更新 `CURRENT.md` 的意义是：
+
+- 生成给人读的当前摘要
+- 提供兼容文本层
+- 维护 handoff 体验
+
+而不是：
+
+- 驱动当前运行时主状态
+- 作为长期晋升的原始事实基线
+
+## 7. Promoter 如何做正式晋升
+
+Promoter 负责从候选层读取 observation，并决定是否晋升到 identity。
+
+它处理的基本流程是：
 
 1. 读取 `candidate/observations.jsonl`
-2. 遍历每条 observation
-3. 先判断是否应拒绝
-4. 再判断是否符合晋升条件
-5. 如果符合，把内容 append 到目标 identity 文件
-6. 回写 observation 的状态
-
-## 5. 当前“晋升”是怎么判定的
-
-当前代码中的晋升规则是硬规则，不是复杂评分器。
-
-### 5.1 可晋升的前置条件
-
-Promoter 只处理这些状态的 observation：
-
-- `candidate`
-- `observed`
-- `promotion_proposal`
-
-如果状态不在这个集合中，直接跳过。
-
-同时还要求：
-
-- `content` 不能为空
-- `promotion_target` 必须能映射到目标文件
-
-当前支持的目标只有：
-
-- `identity.USER_RULES` -> `identity/USER_RULES.md`
-- `identity.USER_PROFILE` -> `identity/USER_PROFILE.md`
-- `identity.SOUL` -> `identity/SOUL.md`
-
-### 5.2 晋升条件
-
-当前只有两类晋升条件：
-
-1. `source == "explicit_user_statement"`
-2. `evidence_count >= repeat_threshold`
-
-其中：
-
-- `repeat_threshold` 默认是 `2`
-- 也就是重复证据达到 2 次及以上时可以晋升
-
-这代表当前系统更偏向两种可靠来源：
-
-- 用户明确说过的话
-- 跨轮次重复出现的稳定模式
-
-### 5.3 拒绝条件
-
-如果 observation 满足任一条件，会被拒绝：
-
-1. 存在 `contradicted_by`
-2. `confidence < 0.25`
-
-也就是说，当前系统先做负向过滤，再做正向晋升。
-
-## 6. 分区写入规则
-
-可以把“谁能写哪里”整理成下面这张权限表。
-
-| 写入者 | 可写目标 | 作用 |
-|---|---|---|
-| `Consolidator` | `archive/history.jsonl` | 把旧会话摘要归档 |
-| `Dream` | `working/CURRENT.md` | 更新当前活跃工作状态 |
-| `Dream` | `archive/reflections.jsonl` | 记录反思、归档笔记 |
-| `Dream` | `candidate/observations.jsonl` | 写入候选观察与晋升提案 |
-| `Promoter` | `identity/SOUL.md` | 晋升稳定助手原则 |
-| `Promoter` | `identity/USER_RULES.md` | 晋升明确用户规则 |
-| `Promoter` | `identity/USER_PROFILE.md` | 晋升稳定用户画像 |
-| `Heartbeat` | `working/CURRENT.md`、`archive/reflections.jsonl` | 受限后台维护 |
-
-如果从权限上理解：
-
-- `archive/history.jsonl` 是归档入口
-- `candidate/observations.jsonl` 是晋升缓冲区
-- `identity/*` 是高权限终点
-- `working/CURRENT.md` 是当前行为层，但不是长期身份层
-
-## 7. 状态机：一条 observation 会经历什么状态
-
-当前实现中，candidate observation 的关键状态如下。
-
-### 7.1 初始状态
-
-Dream 写入 observation 时，默认状态通常是：
-
-- `candidate`
-
-但 Promoter 也兼容读取：
-
-- `observed`
-- `promotion_proposal`
-
-说明当前设计允许上游未来产生更细分状态，但真正实现的主干仍然是 `candidate`。
-
-### 7.2 晋升后
-
-如果满足晋升条件：
-
-- `status = "promoted"`
-- 增加 `promoted_at`
-- 增加 `resolution_reason`
-
-当前 `resolution_reason` 可能是：
-
-- `explicit_user_statement`
-- `repeated_evidence`
-
-### 7.3 拒绝后
-
-如果满足拒绝条件：
-
-- `status = "rejected"`
-- 增加 `rejected_at`
-- 增加 `resolution_reason`
-
-当前 `resolution_reason` 可能是：
-
-- `contradicted`
-- `low_confidence`
-
-### 7.4 仍未处理
-
-如果既不该拒绝，也不满足晋升条件：
-
-- 保持原状态
-- 继续留在 `candidate/observations.jsonl`
-
-这就是“候选池”的意义：可以继续等待未来更多证据，而不是立刻进入 identity。
-
-## 8. 时机：什么时候会发生这些动作
-
-当前系统中，不同阶段的触发时机不同。
-
-### 8.1 Consolidator 的触发时机
-
-触发点在主消息处理链路中：
-
-- 处理新消息前会检查一次
-- 本轮响应结束后，会后台再检查一次
-
-触发条件不是定时，而是：
-
-- 当前会话 prompt token 超过安全预算
-
-所以它是“按压力触发”。
-
-### 8.2 Dream 的触发时机
-
-Dream 有两种触发方式：
-
-1. 手动触发：`/dream`
-2. 定时触发：gateway 启动时注册系统 cron job
-
-默认调度来自 `agents.defaults.dream.intervalH`：
-
-- 默认值是 `2`
-- 即默认每 2 小时执行一次
-
-Dream 每次只处理 `.dream_cursor` 之后的新 `history.jsonl` 记录，并在运行后推进 `.dream_cursor`。
-
-### 8.3 Promoter 的触发时机
-
-Promoter 当前有一种主要自动触发方式：
-
-- gateway 启动时注册系统 cron job
-- 调度周期与 Dream 共用同一套 `dream` 配置
-
-也就是默认：
-
-- Promoter 也会每 2 小时跑一次
-
-因此当前线上节奏通常是：
-
-1. 对话变长 -> Consolidator 把旧消息归档
-2. 到定时点 -> Dream 读取新归档，写入 candidate/working/reflection
-3. 同样的定时系统任务 -> Promoter 扫 candidate，决定晋升或拒绝
-
-注意：
-
-- 当前代码里 Dream 和 Promoter 是两个独立系统 job
-- 它们共享同一调度描述，但逻辑上并不是一个函数内串起来的
-- 所以“候选生成”和“候选晋升”是解耦的
-
-## 9. 游标与状态推进
-
-当前架构里有两个非常关键的推进器。
-
-### 9.1 `session.last_consolidated`
-
-- 这是会话内的压缩边界
-- 表示 `session.messages` 哪一部分已经被归档过
-- 它防止同一段会话被重复摘要
-
-### 9.2 `archive/.dream_cursor`
-
-- 表示 Dream 已消费到哪条 `history.jsonl`
-- Dream 每次只处理 cursor 更大的新归档记录
-- 跑完后会推进到本批次最后一条记录
-
-这两个游标分别负责：
-
-- 会话 -> 归档 的去重推进
-- 归档 -> Dream 的去重推进
-
-## 10. 为什么必须经过 candidate 层
-
-从设计上看，candidate 层解决的是“权限升级”问题，而不只是“记错了”的问题。
-
-如果没有 candidate 层，会变成：
-
-1. 对话被摘要
-2. Dream 做出推断
-3. 推断直接写入 identity
-
-这会导致一个危险结果：
-
-- 单次错误总结
-- 一次误解
-- 一次过度抽象
-
-都可能直接污染未来所有 prompt。
-
-现在的设计把它拆成两步：
-
-1. Dream 只能提出候选
-2. Promoter 再按硬规则晋升
-
-因此 candidate 层本质上是“记忆权限隔离层”。
-
-## 11. 当前实现的安全与回退机制
-
-### 11.1 Dream 不能直接改 identity
-
-Dream 的写权限被工具层限制，只能改：
-
-- `working/CURRENT.md`
-- `archive/reflections.jsonl`
-- `candidate/observations.jsonl`
-
-这是第一道安全阀。
-
-### 11.2 Identity/Working 的关键文件可被版本化
-
-`GitStore` 当前跟踪这些文件：
-
-- `identity/SOUL.md`
-- `identity/USER_RULES.md`
-- `identity/USER_PROFILE.md`
-- `working/CURRENT.md`
-
-Dream 在产生真实改动时会自动提交版本，因此可以用：
-
-- `/dream-log`
-- `/dream-restore`
-
-查看和回退 memory 变更。
-
-### 11.3 Promoter 写 identity 时会去重
-
-Promoter 追加 bullet 前，会先检查内容是否已存在于目标文件。
+2. 过滤掉状态不允许或证据不足的 observation
+3. 判断目标是 `SOUL`、`USER_RULES` 还是 `USER_PROFILE`
+4. 满足条件时 append 到目标 identity 文件
+5. 回写 observation 的处理状态
 
 因此：
 
-- 不会重复无脑追加同一句话
-- 但去重是基于简单文本包含，不是语义去重
+- Dream 负责提炼候选
+- Promoter 负责权限升级
 
-## 12. 当前实现的几个关键特点
+## 8. 为什么这样分层
 
-### 12.1 晋升逻辑偏保守
+这套架构的重点不是“摘要质量绝对正确”，而是“错误摘要也不能轻易获得过高权限”。
 
-当前只认可：
+分层后的效果是：
 
-- 用户明确表达
-- 重复证据
+- committed turn 给 Dream 提供更稳定、去噪的输入
+- `CURRENT.md` 只承担镜像，不再绑架主状态
+- archive 负责保留与检索，不直接变成长期身份
+- candidate 负责缓冲与审核
+- identity 只接受正式晋升结果
 
-这说明系统现阶段更重视“别污染 identity”，而不是“尽快长期记住更多东西”。
+## 9. 与旧架构的区别
 
-### 12.2 `working` 和 `identity` 明确分开
+旧叙述更像：
 
-不是所有重要信息都应该直接晋升。
+```text
+session.messages
+  -> archive/history.jsonl
+  -> Dream
+  -> working/CURRENT.md
+```
 
-例如：
+当前实现更接近：
 
-- 当前任务
-- 最近决策上下文
-- 短期 handoff
+```text
+TurnState + CommitManifest
+  -> TurnCapsule + WorkingSetSnapshot + Artifact digests
+  -> Dream
+  -> CURRENT mirror / reflections / candidate observations
+  -> Promoter
+  -> identity
+```
 
-这些更适合放在 `working/CURRENT.md`，而不是长期写进 `USER_PROFILE`。
+变化的本质是：Dream 的输入从“旧文本推断”切到了“已提交结构化产物”。
 
-### 12.3 当前状态枚举比当前逻辑更宽
+## 10. 结论
 
-Promoter 兼容：
+如果要理解 nanobot 现在的记忆晋升链，可以记成：
 
-- `candidate`
-- `observed`
-- `promotion_proposal`
+- 结构化 committed turn 提供事实输入
+- Dream 负责提炼候选与镜像输出
+- Promoter 负责正式晋升
+- `CURRENT.md` 是镜像，不是主真相源
 
-但上游 Dream 模板主要仍然以 `candidate` 为主。
-
-这说明状态机接口已经为未来更细粒度的候选阶段预留了扩展空间，但当前主实现还比较简单。
-
-## 13. 当前可以如何理解“晋升”
-
-如果用一句更工程化的话来描述：
-
-> 当前 nanobot 的记忆晋升，不是“把总结写进记忆”，而是“把候选观察在满足硬证据条件后，提升为可进入 prompt 的高权限身份记忆”。
-
-所以“晋升”本质上包含两个动作：
-
-1. 权限变化：从 candidate 层进入 identity 层
-2. 注入变化：从默认不注入，变成默认注入 system prompt
-
-这两点同时发生，才是真正意义上的 memory promotion。
-
-## 14. 一条完整示例
-
-假设用户多次说“默认用中文回复”。
-
-完整链路会是：
-
-1. 这几轮对话先进入 `session.messages`
-2. 会话变长后，旧内容被 `Consolidator` 摘要进 `archive/history.jsonl`
-3. Dream 读取这些归档，生成一条 observation，例如：
-   - `content = "Default to Chinese responses"`
-   - `promotion_target = "identity.USER_RULES"`
-   - `source = "explicit_user_statement"` 或 `evidence_count >= 2`
-   - `status = "candidate"`
-4. 这条 observation 被写入 `candidate/observations.jsonl`
-5. Promoter 扫描到它，发现满足晋升条件
-6. 把这条内容 append 到 `identity/USER_RULES.md`
-7. 把 observation 状态改为 `promoted`
-8. 之后这条规则会默认进入 system prompt
-
-这就是当前“记忆晋升”主链路的标准路径。
-
-## 15. 总结
-
-当前架构可以概括为：
-
-- `Consolidator` 负责把会话压缩成可消费归档
-- `Dream` 负责从归档中提炼工作记忆、反思和候选观察
-- `Promoter` 负责把候选观察按硬规则晋升到高权限身份记忆
-- `candidate/observations.jsonl` 是权限隔离层，也是晋升缓冲层
-- `identity/*` 是最终会影响未来 prompt 的高权限记忆层
-
-从实现成熟度看，当前架构已经把“长期记忆污染”这个风险拆成了独立治理问题，并且通过：
-
-- 分区
-- 限权
-- 游标
-- 状态
-- 可回退版本
-
-把记忆晋升做成了一条相对清晰、可审计、可保守演进的流水线。
+不要再把 `CURRENT.md`、`history.jsonl` 或原始消息尾部当成当前晋升链的核心输入层。
