@@ -16,6 +16,12 @@ Update layered memory files based on the analysis below.
 Do NOT guess paths.
 Do NOT edit `identity/*`.
 
+Map:
+- write mirrors to `working/CURRENT.md`
+- write durable notes to `archive/reflections.jsonl`
+- write candidates and promotion proposals to `candidate/observations.jsonl`
+- do not bypass `Promoter` to mutate `identity/*`
+
 ## Editing rules
 - Edit directly - file contents provided below, no read_file needed
 - Use exact text as old_text, include surrounding blank lines for unique match

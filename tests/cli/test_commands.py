@@ -875,7 +875,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
 
 
-def test_gateway_builds_restricted_heartbeat_agent_and_registers_promoter(
+def test_gateway_builds_full_heartbeat_agent_with_identity_write_guard_and_registers_promoter(
     monkeypatch, tmp_path: Path
 ) -> None:
     config_file = _write_instance_config(tmp_path)
@@ -984,22 +984,27 @@ def test_gateway_builds_restricted_heartbeat_agent_and_registers_promoter(
     assert len(_FakeAgentLoop.instances) == 2
 
     heartbeat_agent = _FakeAgentLoop.instances[1]
-    assert heartbeat_agent.kwargs["restrict_to_workspace"] is True
-    assert heartbeat_agent.kwargs["mcp_servers"] is None
-    assert set(heartbeat_agent.tools.unregistered) >= {
-        "write_file", "edit_file", "exec", "spawn", "cron", "message", "notebook_edit"
-    }
+    assert heartbeat_agent.kwargs["restrict_to_workspace"] is config.tools.restrict_to_workspace
+    assert heartbeat_agent.kwargs["mcp_servers"] is config.tools.mcp_servers
+    assert heartbeat_agent.kwargs["cron_service"] is not None
+    assert set(heartbeat_agent.tools.unregistered) == {"write_file", "edit_file"}
     registered_names = [tool.name for tool in heartbeat_agent.tools.registered]
     assert registered_names.count("write_file") == 1
     assert registered_names.count("edit_file") == 1
-    writable_targets = {
+    blocked_targets = {
         str(target)
         for tool in heartbeat_agent.tools.registered
         if getattr(tool, "name", "") == "edit_file"
-        for target in getattr(tool, "_writable_targets", [])
+        for target in getattr(tool, "_blocked_targets", [])
     }
-    assert str(config.workspace_path / "working" / "CURRENT.md") in writable_targets
-    assert str(config.workspace_path / "archive" / "reflections.jsonl") in writable_targets
+    assert str(config.workspace_path / "identity" / "SOUL.md") in blocked_targets
+    assert str(config.workspace_path / "identity" / "USER_RULES.md") in blocked_targets
+    assert str(config.workspace_path / "identity" / "USER_PROFILE.md") in blocked_targets
+    assert heartbeat_agent.tools.get("exec") is not None
+    assert heartbeat_agent.tools.get("spawn") is not None
+    assert heartbeat_agent.tools.get("cron") is not None
+    assert heartbeat_agent.tools.get("message") is not None
+    assert heartbeat_agent.tools.get("notebook_edit") is not None
 
 
 def test_gateway_cron_evaluator_receives_scheduled_reminder_context(

@@ -2,6 +2,12 @@ Compare the new structured Dream inputs against the current layered memory state
 
 The structured Dream inputs are the primary evidence source. Do not reconstruct current short-term state from `working/CURRENT.md` or `archive/history.jsonl`.
 
+Map:
+- authoritative input = committed structured turn data
+- `working/CURRENT.md` = mirror only
+- `candidate/observations.jsonl` = staging area for promotion candidates
+- `identity/*` = protected long-term memory; promotion goes through `Promoter`
+
 Output one line per finding:
 [WORKING] short-lived mirror or handoff state that belongs in working/CURRENT.md
 [REFLECTION] durable archive note for archive/reflections.jsonl

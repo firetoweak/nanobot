@@ -226,6 +226,27 @@ class TestEditFileTool:
 
         assert result.startswith("Error:")
 
+    @pytest.mark.asyncio
+    async def test_blocked_targets_prevent_identity_edits_even_when_workspace_is_writable(self, tmp_path):
+        identity_file = tmp_path / "identity" / "SOUL.md"
+        identity_file.parent.mkdir(parents=True)
+        identity_file.write_text("old", encoding="utf-8")
+        allowed_file = tmp_path / "candidate" / "observations.jsonl"
+        allowed_file.parent.mkdir(parents=True)
+        allowed_file.write_text("old", encoding="utf-8")
+        tool = EditFileTool(
+            workspace=tmp_path,
+            writable_targets=[tmp_path],
+            blocked_targets=[identity_file],
+        )
+
+        denied = await tool.execute(path=str(identity_file), old_text="old", new_text="new")
+        allowed = await tool.execute(path=str(allowed_file), old_text="old", new_text="new")
+
+        assert denied.startswith("Error:")
+        assert "blocked" in denied
+        assert "Successfully edited" in allowed
+
 
 class TestWriteFileTool:
 
@@ -239,6 +260,23 @@ class TestWriteFileTool:
 
         assert "Successfully wrote" in ok
         assert denied.startswith("Error:")
+
+    @pytest.mark.asyncio
+    async def test_blocked_targets_prevent_identity_writes_even_when_workspace_is_writable(self, tmp_path):
+        identity_file = tmp_path / "identity" / "USER_RULES.md"
+        allowed_file = tmp_path / "candidate" / "observations.jsonl"
+        tool = WriteFileTool(
+            workspace=tmp_path,
+            writable_targets=[tmp_path],
+            blocked_targets=[identity_file],
+        )
+
+        denied = await tool.execute(path=str(identity_file), content="blocked")
+        allowed = await tool.execute(path=str(allowed_file), content="{}\n")
+
+        assert denied.startswith("Error:")
+        assert "blocked" in denied
+        assert "Successfully wrote" in allowed
 
 
 # ---------------------------------------------------------------------------

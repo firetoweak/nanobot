@@ -15,4 +15,8 @@ Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegr
 - **Remove**: `edit_file` to delete completed tasks
 - **Rewrite**: `write_file` to replace all tasks
 
+Heartbeat runs through the normal agent loop and may use the same general tools as an ordinary agent turn. Do not treat heartbeat as a special low-permission worker.
+If a heartbeat task surfaces durable facts that belong in long-term identity memory, record them in `candidate/observations.jsonl` and let `Promoter` decide whether to promote them into `identity/*`.
+Treat `working/CURRENT.md` as a mirror only. Do not use it as the authoritative runtime state for memory decisions.
+
 When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.

@@ -700,32 +700,36 @@ def gateway(
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
         exec_config=config.tools.exec,
-        cron_service=None,
-        restrict_to_workspace=True,
+        cron_service=cron,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
-        mcp_servers=None,
+        mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
     )
-    for tool_name in ("write_file", "edit_file", "exec", "spawn", "cron", "message", "notebook_edit"):
+    for tool_name in ("write_file", "edit_file"):
         heartbeat_agent.tools.unregister(tool_name)
     from nanobot.agent.tools.filesystem import EditFileTool, WriteFileTool
-    heartbeat_writable_targets = [
-        config.workspace_path / "working" / "CURRENT.md",
-        config.workspace_path / "archive" / "reflections.jsonl",
+    heartbeat_blocked_targets = [
+        config.workspace_path / "identity" / "SOUL.md",
+        config.workspace_path / "identity" / "USER_RULES.md",
+        config.workspace_path / "identity" / "USER_PROFILE.md",
     ]
+    heartbeat_allowed_dir = (
+        config.workspace_path if (config.tools.restrict_to_workspace or config.tools.exec.sandbox) else None
+    )
     heartbeat_agent.tools.register(WriteFileTool(
         workspace=config.workspace_path,
-        allowed_dir=config.workspace_path,
-        writable_targets=heartbeat_writable_targets,
+        allowed_dir=heartbeat_allowed_dir,
+        blocked_targets=heartbeat_blocked_targets,
     ))
     heartbeat_agent.tools.register(EditFileTool(
         workspace=config.workspace_path,
-        allowed_dir=config.workspace_path,
-        writable_targets=heartbeat_writable_targets,
+        allowed_dir=heartbeat_allowed_dir,
+        blocked_targets=heartbeat_blocked_targets,
     ))
 
     # Set cron callback (needs agent)

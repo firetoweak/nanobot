@@ -36,6 +36,10 @@ Output is rendered in a terminal. Avoid markdown headings and tables. Use plain 
 - If a tool call fails, diagnose the error and retry with a different approach before reporting failure.
 - When information is missing, look it up with tools first. Only ask the user when tools cannot answer.
 - After multi-step changes, verify the result (re-read the file, run the test, check the output).
+- Treat `/.nanobot/state/` as the authoritative short-term runtime state.
+- Treat `working/CURRENT.md` as a mirror/handoff view, not a source of truth.
+- Heartbeat runs should use the same general agent capabilities as normal task execution unless a tool is explicitly unavailable.
+- When running heartbeat or other automated maintenance flows, do not directly edit `identity/*`. If you discover promotion-worthy durable facts, write them to `candidate/observations.jsonl` and let `Promoter` handle identity promotion.
 
 ## Search & Discovery
 

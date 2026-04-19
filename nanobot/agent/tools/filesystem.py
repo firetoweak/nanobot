@@ -49,16 +49,21 @@ class _FsTool(Tool):
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
         writable_targets: list[Path] | None = None,
+        blocked_targets: list[Path] | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
         self._writable_targets = [p.resolve() for p in (writable_targets or [])]
+        self._blocked_targets = [p.resolve() for p in (blocked_targets or [])]
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
 
     def _ensure_writable(self, path: Path) -> None:
+        if any(path == target or _is_under(path, target) for target in self._blocked_targets):
+            blocked = ", ".join(str(target) for target in self._blocked_targets)
+            raise PermissionError(f"Writing to {path} is blocked. Blocked targets: {blocked}")
         if not self._writable_targets:
             return
         if any(path == target or _is_under(path, target) for target in self._writable_targets):

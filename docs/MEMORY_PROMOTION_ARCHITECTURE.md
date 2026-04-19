@@ -94,6 +94,21 @@ committed turn
 
 它是权限缓冲层，而不是长期事实层。
 
+### 3.6 heartbeat 与记忆晋升的关系
+
+heartbeat 是否拥有普通 agent 的工具能力，和长期记忆晋升保护，不是同一个问题。
+
+这里需要分开理解：
+
+- identity 的保护目标，是避免自动流程直接把未经审核的结论写入高权限长期记忆
+- heartbeat 的执行能力，属于“后台触发时能不能正常做事”的问题
+
+因此当前推荐理解是：
+
+- heartbeat 可以是完整 agent 的一种触发方式
+- 但 heartbeat 不应绕过 candidate / Promoter 直接修改 `identity/*`
+- 对 identity 的保护，应当通过 prompt 约束 + runtime 边界实现，而不是把 heartbeat 整体降成低权限执行器
+
 ## 4. Dream 现在如何拿输入
 
 当前 Dream 会遍历结构化状态目录，挑出满足以下条件的 turn：
@@ -187,6 +202,7 @@ Promoter 负责从候选层读取 observation，并决定是否晋升到 identit
 - archive 负责保留与检索，不直接变成长期身份
 - candidate 负责缓冲与审核
 - identity 只接受正式晋升结果
+- heartbeat 是否具备完整工具能力，不改变这条晋升链；真正需要保护的是 `identity/*` 的正式入口
 
 ## 9. 与旧架构的区别
 
@@ -212,13 +228,18 @@ TurnState + CommitManifest
 
 变化的本质是：Dream 的输入从“旧文本推断”切到了“已提交结构化产物”。
 
-## 10. 结论
+## 10. 地图
 
-如果要理解 nanobot 现在的记忆晋升链，可以记成：
+把当前记忆晋升架构记成下面 6 条就够了：
 
-- 结构化 committed turn 提供事实输入
-- Dream 负责提炼候选与镜像输出
-- Promoter 负责正式晋升
-- `CURRENT.md` 是镜像，不是主真相源
+- `/.nanobot/state/` 是短期运行时真相源
+- committed turn 是 Dream 的主输入
+- `working/CURRENT.md` 是 mirror / handoff，不是 source of truth
+- `candidate/observations.jsonl` 是长期晋升前的缓冲层
+- `identity/*` 是受保护的高权限长期层
+- 正式进入 `identity/*` 的路径是 `candidate -> Promoter -> identity`
 
-不要再把 `CURRENT.md`、`history.jsonl` 或原始消息尾部当成当前晋升链的核心输入层。
+因此：
+
+- 不要再把 `CURRENT.md`、`history.jsonl` 或原始消息尾部当成当前晋升链的核心输入层
+- 不要把 heartbeat 的工具能力问题，和 identity 的保护边界混为一谈
